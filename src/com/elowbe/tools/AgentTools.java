@@ -15,6 +15,8 @@ import java.util.function.BooleanSupplier;
 
 import org.json.JSONObject;
 
+import com.elowbe.agent.AgentRunner;
+
 public class AgentTools {
 	private static final int MAX_OUTPUT_CHARS = 40_000;
 	private static final Duration BASH_TIMEOUT = Duration.ofSeconds(60);
@@ -62,6 +64,11 @@ public class AgentTools {
 
 	public static ToolResult execute(String name, JSONObject arguments, File workingDirectory,
 			BooleanSupplier cancelRequested) {
+		return execute(name, arguments, workingDirectory, cancelRequested, 0);
+	}
+
+	public static ToolResult execute(String name, JSONObject arguments, File workingDirectory,
+			BooleanSupplier cancelRequested, int subtaskDepth) {
 		if (name == null || name.isBlank()) {
 			return ToolResult.output("Tool error: missing tool name");
 		}
@@ -78,6 +85,7 @@ public class AgentTools {
 			case "bash" -> bash(arguments, workingDirectory, cancelRequested);
 			case "edit" -> edit(arguments, workingDirectory);
 			case "write" -> write(arguments, workingDirectory);
+			case "subtask" -> subtask(arguments, workingDirectory, cancelRequested, subtaskDepth);
 			case "done" -> done(arguments);
 			default -> ToolResult.output("Tool error: unknown tool: " + name);
 			};
@@ -188,6 +196,20 @@ public class AgentTools {
 			result.append("stderr:\n").append(stderr.text()).append('\n');
 		}
 		return ToolResult.output(truncate(result.toString().trim()));
+	}
+
+	private static ToolResult subtask(JSONObject arguments, File workingDirectory, BooleanSupplier cancelRequested,
+			int subtaskDepth) throws IOException {
+		if (subtaskDepth > 0) {
+			return ToolResult.output("subtask: nested subtasks are disabled; finish this worker task directly");
+		}
+		String task = first(arguments, "task", "instruction", "goal");
+		if (task.isBlank()) {
+			return ToolResult.output("subtask: missing task");
+		}
+		String context = first(arguments, "context", "summary");
+		String result = AgentRunner.runSubtask(task, context, workingDirectory, cancelRequested);
+		return ToolResult.output("subtask result:\n" + truncate(result));
 	}
 
 	private static ToolResult edit(JSONObject arguments, File workingDirectory) throws IOException {

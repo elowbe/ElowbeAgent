@@ -8,6 +8,7 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.ArrayList;
+import java.util.Locale;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.json.JSONArray;
@@ -29,8 +30,8 @@ public class ElowbeAgent extends JinCanvas {
 	private static final File SYSTEM_PROMPT_FILE = resolveSystemPromptFile();
 
 	/** Ollama model used for non-slash agent instructions. */
-	private static String agentModel = "qwen3.5:9b";
-	private static String ollamaUrl = "http://10.0.0.23:11434";
+	private static String agentModel = "qwen3.5";
+	private static String ollamaUrl = "http://10.0.0.8:11434";
 	InputWidget commandInput;
 	PrintWidget printWidget;
 	File directory = new File("agenttest");
@@ -96,6 +97,36 @@ public class ElowbeAgent extends JinCanvas {
 			parent.mkdirs();
 		}
 		Files.writeString(SYSTEM_PROMPT_FILE.toPath(), systemPrompt, StandardCharsets.UTF_8);
+	}
+
+	private JSONObject buildUserMessage(String instruction) {
+		return new JSONObject()
+				.put("role", "user")
+				.put("content", buildProjectAwareInstruction(instruction));
+	}
+
+	private String buildProjectAwareInstruction(String instruction) {
+		ProjectProfile profile = ProjectProfile.from(instruction, directory);
+		StringBuilder content = new StringBuilder();
+		content.append("Runtime project preflight from ElowbeAgent:\n");
+		content.append("- Current directory: ").append(profile.currentDirectoryPath()).append('\n');
+		content.append("- Java and Maven are the default stack unless the user explicitly requested another language, build tool, or framework.\n");
+		content.append("- Application type guidance: ").append(profile.frameworkGuidance).append('\n');
+		if (profile.mavenProjectRoot == null) {
+			content.append("- Maven project check: no pom.xml was found in the current directory or any parent directory.\n");
+			if (profile.usesJavaMavenDefault) {
+				content.append("- REQUIRED FIRST STEP: create a Maven project in the current directory before doing any feature work. ");
+				content.append("Create pom.xml and the standard src/main/java and src/test/java layout, then continue the user's task inside that Maven project.\n");
+			} else {
+				content.append("- The user explicitly requested a non-default stack; follow that request instead of creating a Maven project.\n");
+			}
+		} else {
+			content.append("- Maven project check: pom.xml found at ")
+					.append(profile.mavenProjectRoot.getPath())
+					.append(". Run Maven commands from this project root.\n");
+		}
+		content.append("\nUser request:\n").append(instruction);
+		return content.toString();
 	}
 
 	private JSONArray buildChatRequest(JSONObject userMessage) {
@@ -266,9 +297,7 @@ public class ElowbeAgent extends JinCanvas {
 			return;
 		}
 
-		JSONObject userMessage = new JSONObject();
-		userMessage.put("role", "user");
-		userMessage.put("content", instruction);
+		JSONObject userMessage = buildUserMessage(instruction);
 
 		JSONArray request = buildChatRequest(userMessage);
 		int turnStart = request.length() - 1;
@@ -603,6 +632,93 @@ public class ElowbeAgent extends JinCanvas {
 			controlHeld = pressed;
 		} else if (e.getKeyCode() == KeyEvent.VK_SPACE) {
 			spaceHeld = pressed;
+		}
+	}
+
+	private static class ProjectProfile {
+		private final File currentDirectory;
+		private final File mavenProjectRoot;
+		private final boolean usesJavaMavenDefault;
+		private final String frameworkGuidance;
+
+		private ProjectProfile(File currentDirectory, File mavenProjectRoot, boolean usesJavaMavenDefault,
+				String frameworkGuidance) {
+			this.currentDirectory = currentDirectory;
+			this.mavenProjectRoot = mavenProjectRoot;
+			this.usesJavaMavenDefault = usesJavaMavenDefault;
+			this.frameworkGuidance = frameworkGuidance;
+		}
+
+		private static ProjectProfile from(String instruction, File directory) {
+			File current = directory == null ? new File(System.getProperty("user.dir")) : directory;
+			File mavenRoot = findMavenProjectRoot(current);
+			boolean javaMavenDefault = !explicitlyRequestsAnotherStack(instruction);
+			return new ProjectProfile(current, mavenRoot, javaMavenDefault, frameworkGuidance(instruction));
+		}
+
+		private String currentDirectoryPath() {
+			try {
+				return currentDirectory.getCanonicalPath();
+			} catch (IOException e) {
+				return currentDirectory.getAbsolutePath();
+			}
+		}
+
+		private static File findMavenProjectRoot(File start) {
+			File current;
+			try {
+				current = start.getCanonicalFile();
+			} catch (IOException e) {
+				current = start.getAbsoluteFile();
+			}
+			if (current.isFile()) {
+				current = current.getParentFile();
+			}
+			while (current != null) {
+				File pom = new File(current, "pom.xml");
+				if (pom.isFile()) {
+					return current;
+				}
+				current = current.getParentFile();
+			}
+			return null;
+		}
+
+		private static String frameworkGuidance(String instruction) {
+			String text = normalize(instruction);
+			if (mentionsAny(text, "web app", "webapp", "website", "rest api", "http api", "backend", "server")) {
+				return "use Spring Boot with Maven for web applications unless the user explicitly chose another stack.";
+			}
+			if (mentionsAny(text, "gui", "desktop app", "desktop application", "windowed app", "native app")) {
+				return "use Java Swing with Maven for GUI or desktop applications unless the user explicitly chose another stack.";
+			}
+			if (mentionsAny(text, "cli", "command line", "terminal app", "console app")) {
+				return "use a Java Maven CLI structure unless the user explicitly chose another stack.";
+			}
+			return "use a Java Maven project structure by default.";
+		}
+
+		private static boolean explicitlyRequestsAnotherStack(String instruction) {
+			String text = normalize(instruction);
+			return mentionsAny(text,
+					"python", "pip", "django", "flask", "fastapi",
+					"javascript", "typescript", "node", "node.js", "npm", "pnpm", "yarn", "react", "vue", "angular",
+					"gradle", "kotlin", "scala", "groovy",
+					"rust", "cargo", "go ", "golang", "c#", ".net", "dotnet",
+					"ruby", "rails", "php", "laravel", "swift");
+		}
+
+		private static String normalize(String value) {
+			return value == null ? "" : value.toLowerCase(Locale.ROOT);
+		}
+
+		private static boolean mentionsAny(String text, String... terms) {
+			for (String term : terms) {
+				if (text.contains(term)) {
+					return true;
+				}
+			}
+			return false;
 		}
 	}
 

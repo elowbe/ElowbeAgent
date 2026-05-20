@@ -8,6 +8,10 @@ public class ToolChoiceSchema {
 	}
 
 	public static JSONObject build() {
+		return build(true);
+	}
+
+	public static JSONObject build(boolean includeSubtask) {
 		JSONObject schema = object();
 		schema.put("additionalProperties", false);
 		schema.put("required", new JSONArray()
@@ -33,7 +37,7 @@ public class ToolChoiceSchema {
 		properties.put("plan", new JSONObject()
 				.put("type", "string")
 				.put("description", "Brief plan for the current step. Use an empty string when not needed."));
-		properties.put("tool_calls", toolCallsSchema());
+		properties.put("tool_calls", toolCallsSchema(includeSubtask));
 		properties.put("complete", new JSONObject()
 				.put("type", "boolean")
 				.put("description", "True only when the user's task is fully complete."));
@@ -45,19 +49,23 @@ public class ToolChoiceSchema {
 		return schema;
 	}
 
-	private static JSONObject toolCallsSchema() {
+	private static JSONObject toolCallsSchema(boolean includeSubtask) {
 		JSONObject call = object();
 		call.put("additionalProperties", false);
 		call.put("required", new JSONArray().put("name").put("arguments"));
+		JSONArray toolNames = new JSONArray()
+				.put("read")
+				.put("bash")
+				.put("edit")
+				.put("write");
+		if (includeSubtask) {
+			toolNames.put("subtask");
+		}
+		toolNames.put("done");
 		call.put("properties", new JSONObject()
 				.put("name", new JSONObject()
 						.put("type", "string")
-						.put("enum", new JSONArray()
-								.put("read")
-								.put("bash")
-								.put("edit")
-								.put("write")
-								.put("done")))
+						.put("enum", toolNames))
 				.put("arguments", new JSONObject()
 						.put("type", "object")
 						.put("description", "Tool-specific arguments.")));
