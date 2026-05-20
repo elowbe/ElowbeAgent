@@ -30,7 +30,7 @@ public class ElowbeAgent extends JinCanvas {
 	private static final File SYSTEM_PROMPT_FILE = resolveSystemPromptFile();
 
 	/** Ollama model used for non-slash agent instructions. */
-	private static String agentModel = "qwen3.5";
+	private static String agentModel = "qwen3.6";
 	private static String ollamaUrl = "http://10.0.0.8:11434";
 	InputWidget commandInput;
 	PrintWidget printWidget;
@@ -38,6 +38,10 @@ public class ElowbeAgent extends JinCanvas {
 	private String systemPrompt = "";
 	private final JSONArray chatHistory = new JSONArray();
 	private volatile boolean agentBusy;
+	/** Total input + output tokens consumed by the active or latest agent run. */
+	public volatile long agentTokenCount;
+	/** Total input + output tokens consumed across all agent runs in this session. */
+	public volatile long totalAgentTokenCount;
 	private final AtomicBoolean agentCancelRequested = new AtomicBoolean();
 	private volatile Thread agentThread;
 	private OptionsWidget modelPickerWidget;
@@ -302,6 +306,7 @@ public class ElowbeAgent extends JinCanvas {
 		JSONArray request = buildChatRequest(userMessage);
 		int turnStart = request.length() - 1;
 
+		agentTokenCount = 0;
 		agentBusy = true;
 		agentCancelRequested.set(false);
 
@@ -328,7 +333,8 @@ public class ElowbeAgent extends JinCanvas {
 					}
 					printWidget.print("<#green>");
 					printWidget.setColor(Colors.green);
-				}, () -> agentCancelRequested.get() || Thread.currentThread().isInterrupted());
+				}, this::addAgentTokenUsage,
+						() -> agentCancelRequested.get() || Thread.currentThread().isInterrupted());
 
 				if (!agentCancelRequested.get()) {
 					for (int i = turnStart; i < request.length(); i++) {
@@ -361,6 +367,16 @@ public class ElowbeAgent extends JinCanvas {
 		}, "elowbe-agent-chat");
 		agentThread = thread;
 		thread.start();
+	}
+
+	private synchronized void addAgentTokenUsage(JSONObject usage) {
+		if (usage == null) {
+			return;
+		}
+		long totalTokens = usage.optLong("total_tokens",
+				usage.optLong("prompt_tokens", 0) + usage.optLong("completion_tokens", 0));
+		agentTokenCount += totalTokens;
+		totalAgentTokenCount += totalTokens;
 	}
 
 	private boolean cancelAgent() {
@@ -591,7 +607,12 @@ public class ElowbeAgent extends JinCanvas {
 
 		t2d.drawString(" " + truncatePath(directory.getAbsolutePath()) + " ", 2,
 				commandInput.row + 2 + commandInput.height - 4);
-
+		t2d.drawString(" " + agentModel +" ["+ totalAgentTokenCount + " tokens : "+tokenCost(totalAgentTokenCount)+ "] ", 2,
+				0);
+	}
+	
+	public String tokenCost(float agentTokenCount) {
+		return String.format("$%.2f", ((agentTokenCount/1000000f)* 25f));
 	}
 
 	public void destroy() {

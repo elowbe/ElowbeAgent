@@ -16,7 +16,7 @@ import com.elowbe.tools.ToolResult;
 import lib.console.util.OllamaAPI;
 
 public class AgentRunner {
-	private static final int MAX_TURNS = 40;
+	private static final int MAX_TURNS = 400;
 	private static final int MAX_SUBTASK_DEPTH = 1;
 	private static final int MAX_SUBTASK_RESULT_CHARS = 40_000;
 	private static final BooleanSupplier NEVER_CANCEL = () -> false;
@@ -27,7 +27,7 @@ public class AgentRunner {
 			Return a concise result that includes what you changed or learned, any files touched,
 			and anything the master agent must know before continuing.
 
-			You must always respond with the JSON object required by the active Ollama JSON schema.
+			You must always respond with the JSON object required by the active JSON schema.
 			Do not wrap it in markdown.
 
 			Available tools:
@@ -59,26 +59,37 @@ public class AgentRunner {
 		void accept(String name, JSONObject arguments, String result);
 	}
 
+	@FunctionalInterface
+	public interface UsageSink {
+		void accept(JSONObject usage);
+	}
+
 	private AgentRunner() {
 	}
 
 	public static void run(JSONArray messages, File workingDirectory, TokenSink tokenSink,
 			ThinkingSink thinkingSink, ToolSink toolSink) throws IOException {
-		run(messages, workingDirectory, tokenSink, thinkingSink, toolSink, NEVER_CANCEL);
+		run(messages, workingDirectory, tokenSink, thinkingSink, toolSink, null, NEVER_CANCEL);
 	}
 
 	public static void run(JSONArray messages, File workingDirectory, TokenSink tokenSink,
 			ThinkingSink thinkingSink, ToolSink toolSink, BooleanSupplier cancelRequested) throws IOException {
-		run(messages, workingDirectory, tokenSink, thinkingSink, toolSink, cancelRequested, 0);
+		run(messages, workingDirectory, tokenSink, thinkingSink, toolSink, null, cancelRequested);
+	}
+
+	public static void run(JSONArray messages, File workingDirectory, TokenSink tokenSink,
+			ThinkingSink thinkingSink, ToolSink toolSink, UsageSink usageSink, BooleanSupplier cancelRequested)
+			throws IOException {
+		run(messages, workingDirectory, tokenSink, thinkingSink, toolSink, usageSink, cancelRequested, 0);
 	}
 
 	public static String runSubtask(String task, String context, File workingDirectory, BooleanSupplier cancelRequested)
 			throws IOException {
-		return runSubtask(task, context, workingDirectory, cancelRequested, null, null);
+		return runSubtask(task, context, workingDirectory, cancelRequested, null, null, null);
 	}
 
 	private static String runSubtask(String task, String context, File workingDirectory, BooleanSupplier cancelRequested,
-			ThinkingSink thinkingSink, ToolSink toolSink) throws IOException {
+			ThinkingSink thinkingSink, ToolSink toolSink, UsageSink usageSink) throws IOException {
 		if (task == null || task.isBlank()) {
 			return "Subtask error: missing task";
 		}
@@ -100,13 +111,15 @@ public class AgentRunner {
 				.put("content", userContent.toString()));
 
 		StringBuilder result = new StringBuilder();
-		run(messages, workingDirectory, result::append, thinkingSink, toolSink, cancelRequested, MAX_SUBTASK_DEPTH);
+		run(messages, workingDirectory, result::append, thinkingSink, toolSink, usageSink, cancelRequested,
+				MAX_SUBTASK_DEPTH);
 		String text = result.toString().trim();
 		return text.isBlank() ? "Subtask finished without a final response." : text;
 	}
 
 	private static void run(JSONArray messages, File workingDirectory, TokenSink tokenSink,
-			ThinkingSink thinkingSink, ToolSink toolSink, BooleanSupplier cancelRequested, int subtaskDepth)
+			ThinkingSink thinkingSink, ToolSink toolSink, UsageSink usageSink, BooleanSupplier cancelRequested,
+			int subtaskDepth)
 			throws IOException {
 		if (cancelRequested == null) {
 			cancelRequested = NEVER_CANCEL;
@@ -131,6 +144,8 @@ public class AgentRunner {
 							}
 						}
 					}, null, cancelRequested);
+			emitUsage(assistantMessage, usageSink);
+			assistantMessage.remove("usage");
 			throwIfCancelled(cancelRequested);
 			messages.put(assistantMessage);
 
@@ -158,7 +173,7 @@ public class AgentRunner {
 					JSONObject arguments = normalizeArguments(call.opt("arguments"));
 					throwIfCancelled(cancelRequested);
 					ToolResult result = executeTool(name, arguments, workingDirectory, cancelRequested, subtaskDepth,
-							thinkingSink, toolSink);
+							thinkingSink, toolSink, usageSink);
 					throwIfCancelled(cancelRequested);
 					if (toolSink != null) {
 						toolSink.accept(name, arguments, result.getOutput());
@@ -198,7 +213,8 @@ public class AgentRunner {
 	}
 
 	private static ToolResult executeTool(String name, JSONObject arguments, File workingDirectory,
-			BooleanSupplier cancelRequested, int subtaskDepth, ThinkingSink thinkingSink, ToolSink toolSink)
+			BooleanSupplier cancelRequested, int subtaskDepth, ThinkingSink thinkingSink, ToolSink toolSink,
+			UsageSink usageSink)
 			throws IOException {
 		if (!"subtask".equals(name)) {
 			return AgentTools.execute(name, arguments, workingDirectory, cancelRequested, subtaskDepth);
@@ -241,7 +257,7 @@ public class AgentRunner {
 						if (toolSink != null) {
 							toolSink.accept("subtask." + toolName, toolArguments, toolResult);
 						}
-					});
+					}, usageSink);
 		} catch (IOException e) {
 			if (cancelRequested.getAsBoolean()) {
 				throw e;
@@ -405,6 +421,16 @@ public class AgentRunner {
 				.put("result", output == null ? "" : output)
 				.toString());
 		messages.put(message);
+	}
+
+	private static void emitUsage(JSONObject assistantMessage, UsageSink usageSink) {
+		if (usageSink == null || assistantMessage == null) {
+			return;
+		}
+		JSONObject usage = assistantMessage.optJSONObject("usage");
+		if (usage != null && usage.length() > 0) {
+			usageSink.accept(usage);
+		}
 	}
 
 	private static void appendUserInstruction(JSONArray messages, String content) {

@@ -178,7 +178,8 @@ public class AgentTools {
 		if (cancelled) {
 			result.append("Cancelled\n");
 		} else if (timedOut) {
-			result.append("Timed out after ").append(BASH_TIMEOUT.toSeconds()).append(" seconds\n");
+			result.append("Timed out after ").append(BASH_TIMEOUT.toSeconds())
+					.append(" seconds while the process was still alive\n");
 		}
 		result.append("exit_code: ");
 		if (completed) {
