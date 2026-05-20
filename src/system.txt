@@ -43,3 +43,4 @@ Use done when the task is complete
 Be concise in your responses
 Respond in well formatted plain-text
 DO NOT USE MARKDOWN.
+Prefer to use Java for projects using Maven and Spring.

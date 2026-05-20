@@ -8,12 +8,14 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.ArrayList;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
 
 import com.elowbe.agent.AgentRunner;
 import com.elowbe.commands.Command;
+import com.elowbe.tools.AgentTools;
 import com.jinteractive.main.Colors;
 
 import lib.console.main.JinCanvas;
@@ -35,12 +37,17 @@ public class ElowbeAgent extends JinCanvas {
 	private String systemPrompt = "";
 	private final JSONArray chatHistory = new JSONArray();
 	private volatile boolean agentBusy;
+	private final AtomicBoolean agentCancelRequested = new AtomicBoolean();
+	private volatile Thread agentThread;
 	private OptionsWidget modelPickerWidget;
+	private boolean controlHeld;
+	private boolean spaceHeld;
 
 	public static void main(String[] args) {
 		// Makes a window with 1280x720 pixel resolution and a console of 40 columns and
 		// 30 rows.
 		OllamaAPI.BASE_URL = ollamaUrl;
+		Runtime.getRuntime().addShutdownHook(new Thread(AgentTools::cancelActiveProcesses, "elowbe-agent-shutdown"));
 		JinConsole.start(new ElowbeAgent(), "Agent", 90, 40, 960, 720);
 	}
 
@@ -267,8 +274,9 @@ public class ElowbeAgent extends JinCanvas {
 		int turnStart = request.length() - 1;
 
 		agentBusy = true;
+		agentCancelRequested.set(false);
 
-		new Thread(() -> {
+		Thread thread = new Thread(() -> {
 			String previousModel = OllamaAPI.model;
 			OllamaAPI.model = agentModel;
 			try {
@@ -291,21 +299,56 @@ public class ElowbeAgent extends JinCanvas {
 					}
 					printWidget.print("<#green>");
 					printWidget.setColor(Colors.green);
-				});
+				}, () -> agentCancelRequested.get() || Thread.currentThread().isInterrupted());
 
-				for (int i = turnStart; i < request.length(); i++) {
-					chatHistory.put(request.get(i));
+				if (!agentCancelRequested.get()) {
+					for (int i = turnStart; i < request.length(); i++) {
+						chatHistory.put(request.get(i));
+					}
+					printWidget.println();
 				}
-				printWidget.println();
 			} catch (IOException e) {
-				printWidget.println("Agent error: " + e.getMessage());
+				if (agentCancelRequested.get() || Thread.currentThread().isInterrupted()) {
+					printWidget.println();
+					printWidget.println("Agent cancelled.");
+				} else {
+					printWidget.println("Agent error: " + e.getMessage());
+				}
 			} catch (Exception e) {
-				printWidget.println("Agent error: " + e.getMessage());
+				if (agentCancelRequested.get() || Thread.currentThread().isInterrupted()) {
+					printWidget.println();
+					printWidget.println("Agent cancelled.");
+				} else {
+					printWidget.println("Agent error: " + e.getMessage());
+				}
 			} finally {
 				OllamaAPI.model = previousModel;
 				agentBusy = false;
+				agentCancelRequested.set(false);
+				if (agentThread == Thread.currentThread()) {
+					agentThread = null;
+				}
 			}
-		}, "elowbe-agent-chat").start();
+		}, "elowbe-agent-chat");
+		agentThread = thread;
+		thread.start();
+	}
+
+	private boolean cancelAgent() {
+		if (!agentBusy) {
+			return false;
+		}
+		if (!agentCancelRequested.compareAndSet(false, true)) {
+			return true;
+		}
+		printWidget.println();
+		printWidget.println("Cancelling agent...");
+		AgentTools.cancelActiveProcesses();
+		Thread thread = agentThread;
+		if (thread != null) {
+			thread.interrupt();
+		}
+		return true;
 	}
 
 	public String getAgentModel() {
@@ -449,6 +492,7 @@ public class ElowbeAgent extends JinCanvas {
 			printWidget.println("/clear             clear chat history");
 			printWidget.println("/model             choose Ollama model");
 			printWidget.println("/system            system prompt (" + SYSTEM_PROMPT_FILE.getPath() + ")");
+			printWidget.println("Ctrl+Shift+C      cancel the running agent and its process");
 			printWidget.println("cd [path]          change directory (~ for home)");
 			printWidget.println("ls [path]          list directory contents");
 			printWidget.println("mkdir [-p] dir     create directory");
@@ -522,7 +566,8 @@ public class ElowbeAgent extends JinCanvas {
 	}
 
 	public void destroy() {
-		// Use to cleanup at the end
+		cancelAgent();
+		AgentTools.cancelActiveProcesses();
 	}
 
 	public void scroll(int amount) {
@@ -530,11 +575,35 @@ public class ElowbeAgent extends JinCanvas {
 	}
 
 	public void keyDown(KeyEvent e) {
-
+		updateHeldKeys(e, true);
+		if (controlHeld && spaceHeld) {
+			if (e.getKeyCode() == KeyEvent.VK_UP) {
+				printWidget.scroll(-1);
+				e.consume();
+				return;
+			}
+			if (e.getKeyCode() == KeyEvent.VK_DOWN) {
+				printWidget.scroll(1);
+				e.consume();
+				return;
+			}
+		}
+		if (e.getKeyCode() == KeyEvent.VK_C && e.isControlDown() && e.isShiftDown() && cancelAgent()) {
+			e.consume();
+		}
 	}
 
 	public void keyUp(KeyEvent e) {
+		updateHeldKeys(e, false);
 
+	}
+
+	private void updateHeldKeys(KeyEvent e, boolean pressed) {
+		if (e.getKeyCode() == KeyEvent.VK_CONTROL) {
+			controlHeld = pressed;
+		} else if (e.getKeyCode() == KeyEvent.VK_SPACE) {
+			spaceHeld = pressed;
+		}
 	}
 
 	@Override

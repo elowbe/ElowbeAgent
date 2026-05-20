@@ -2,6 +2,8 @@ package com.elowbe.agent;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.InterruptedIOException;
+import java.util.function.BooleanSupplier;
 
 import org.json.JSONArray;
 import org.json.JSONException;
@@ -15,6 +17,7 @@ import lib.console.util.OllamaAPI;
 
 public class AgentRunner {
 	private static final int MAX_TURNS = 40;
+	private static final BooleanSupplier NEVER_CANCEL = () -> false;
 
 	@FunctionalInterface
 	public interface TokenSink {
@@ -36,9 +39,18 @@ public class AgentRunner {
 
 	public static void run(JSONArray messages, File workingDirectory, TokenSink tokenSink,
 			ThinkingSink thinkingSink, ToolSink toolSink) throws IOException {
+		run(messages, workingDirectory, tokenSink, thinkingSink, toolSink, NEVER_CANCEL);
+	}
+
+	public static void run(JSONArray messages, File workingDirectory, TokenSink tokenSink,
+			ThinkingSink thinkingSink, ToolSink toolSink, BooleanSupplier cancelRequested) throws IOException {
+		if (cancelRequested == null) {
+			cancelRequested = NEVER_CANCEL;
+		}
 		JSONObject format = ToolChoiceSchema.build();
 
 		for (int turn = 0; turn < MAX_TURNS; turn++) {
+			throwIfCancelled(cancelRequested);
 			JSONObject assistantMessage = OllamaAPI.streamChatCompletion(messages, null, format,
 					new OllamaAPI.ChatStreamListener() {
 						@Override
@@ -51,7 +63,8 @@ public class AgentRunner {
 								thinkingSink.accept(token);
 							}
 						}
-					}, null);
+					}, null, cancelRequested);
+			throwIfCancelled(cancelRequested);
 			messages.put(assistantMessage);
 
 			JSONObject step = parseStep(assistantMessage.optString("content", ""));
@@ -76,7 +89,9 @@ public class AgentRunner {
 
 					String name = call.optString("name", "");
 					JSONObject arguments = normalizeArguments(call.opt("arguments"));
-					ToolResult result = AgentTools.execute(name, arguments, workingDirectory);
+					throwIfCancelled(cancelRequested);
+					ToolResult result = AgentTools.execute(name, arguments, workingDirectory, cancelRequested);
+					throwIfCancelled(cancelRequested);
 					if (toolSink != null) {
 						toolSink.accept(name, arguments, result.getOutput());
 					}
@@ -198,5 +213,11 @@ public class AgentRunner {
 		messages.put(new JSONObject()
 				.put("role", "user")
 				.put("content", content));
+	}
+
+	private static void throwIfCancelled(BooleanSupplier cancelRequested) throws InterruptedIOException {
+		if (cancelRequested.getAsBoolean()) {
+			throw new InterruptedIOException("Agent cancelled");
+		}
 	}
 }

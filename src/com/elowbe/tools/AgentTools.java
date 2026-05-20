@@ -8,36 +8,90 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BooleanSupplier;
 
 import org.json.JSONObject;
 
 public class AgentTools {
 	private static final int MAX_OUTPUT_CHARS = 40_000;
 	private static final Duration BASH_TIMEOUT = Duration.ofSeconds(60);
+	private static final BooleanSupplier NEVER_CANCEL = () -> false;
+	private static final Set<ManagedProcess> ACTIVE_PROCESSES = ConcurrentHashMap.newKeySet();
+	private static final String BASH_WRAPPER = """
+			emulate -L zsh
+			setopt no_monitor 2>/dev/null || true
+
+			cleanup_agent_jobs() {
+			  trap - EXIT HUP INT TERM
+			  local -a job_pids
+			  job_pids=("${(@f)$(jobs -pr 2>/dev/null)}")
+			  if (( ${#job_pids[@]} )); then
+			    kill -TERM $job_pids 2>/dev/null || true
+			    sleep 0.2
+			    job_pids=("${(@f)$(jobs -pr 2>/dev/null)}")
+			    if (( ${#job_pids[@]} )); then
+			      kill -KILL $job_pids 2>/dev/null || true
+			    fi
+			    wait 2>/dev/null || true
+			  fi
+			}
+
+			disown() {
+			  print -u2 "disown is disabled for managed agent commands"
+			  return 1
+			}
+
+			trap 'cleanup_agent_jobs; exit 130' HUP INT TERM
+			trap 'cleanup_agent_jobs' EXIT
+
+			eval "$1"
+			status=$?
+			cleanup_agent_jobs
+			exit $status
+			""";
 
 	private AgentTools() {
 	}
 
 	public static ToolResult execute(String name, JSONObject arguments, File workingDirectory) {
+		return execute(name, arguments, workingDirectory, NEVER_CANCEL);
+	}
+
+	public static ToolResult execute(String name, JSONObject arguments, File workingDirectory,
+			BooleanSupplier cancelRequested) {
 		if (name == null || name.isBlank()) {
 			return ToolResult.output("Tool error: missing tool name");
 		}
 		if (arguments == null) {
 			arguments = new JSONObject();
 		}
+		if (cancelRequested == null) {
+			cancelRequested = NEVER_CANCEL;
+		}
 
 		try {
 			return switch (name) {
 			case "read" -> read(arguments, workingDirectory);
-			case "bash" -> bash(arguments, workingDirectory);
+			case "bash" -> bash(arguments, workingDirectory, cancelRequested);
 			case "edit" -> edit(arguments, workingDirectory);
 			case "write" -> write(arguments, workingDirectory);
 			case "done" -> done(arguments);
 			default -> ToolResult.output("Tool error: unknown tool: " + name);
 			};
+		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+			return ToolResult.output("Tool error: interrupted");
 		} catch (Exception e) {
 			return ToolResult.output("Tool error: " + e.getMessage());
+		}
+	}
+
+	public static void cancelActiveProcesses() {
+		for (ManagedProcess process : ACTIVE_PROCESSES) {
+			process.destroy();
 		}
 	}
 
@@ -50,10 +104,14 @@ public class AgentTools {
 		return ToolResult.output(truncate(content));
 	}
 
-	private static ToolResult bash(JSONObject arguments, File workingDirectory) throws IOException, InterruptedException {
+	private static ToolResult bash(JSONObject arguments, File workingDirectory, BooleanSupplier cancelRequested)
+			throws IOException, InterruptedException {
 		String command = first(arguments, "command", "cmd");
 		if (command.isBlank()) {
 			return ToolResult.output("bash: missing command");
+		}
+		if (cancelRequested.getAsBoolean()) {
+			return ToolResult.output("bash: cancelled");
 		}
 
 		File cwd = workingDirectory;
@@ -64,9 +122,11 @@ public class AgentTools {
 			cwd.mkdirs();
 		}
 
-		Process process = new ProcessBuilder("/bin/zsh", "-lc", command)
+		Process process = new ProcessBuilder("/bin/zsh", "-lc", BASH_WRAPPER, "elowbe-managed-bash", command)
 				.directory(cwd)
 				.start();
+		ManagedProcess managedProcess = new ManagedProcess(process);
+		ACTIVE_PROCESSES.add(managedProcess);
 
 		StreamCollector stdout = new StreamCollector(process.getInputStream());
 		StreamCollector stderr = new StreamCollector(process.getErrorStream());
@@ -75,19 +135,52 @@ public class AgentTools {
 		outThread.start();
 		errThread.start();
 
-		boolean completed = process.waitFor(BASH_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
-		if (!completed) {
-			process.destroyForcibly();
+		boolean completed = false;
+		boolean timedOut = false;
+		boolean cancelled = false;
+		long deadline = System.nanoTime() + BASH_TIMEOUT.toNanos();
+		try {
+			while (true) {
+				managedProcess.rememberDescendants();
+				if (cancelRequested.getAsBoolean() || Thread.currentThread().isInterrupted()) {
+					cancelled = true;
+					managedProcess.destroy();
+					break;
+				}
+				if (process.waitFor(100, TimeUnit.MILLISECONDS)) {
+					completed = true;
+					break;
+				}
+				if (System.nanoTime() >= deadline) {
+					timedOut = true;
+					managedProcess.destroy();
+					break;
+				}
+			}
+		} finally {
+			managedProcess.rememberDescendants();
+			managedProcess.destroy();
+			ACTIVE_PROCESSES.remove(managedProcess);
 		}
 
 		outThread.join();
 		errThread.join();
 
 		StringBuilder result = new StringBuilder();
-		if (!completed) {
+		if (cancelled) {
+			result.append("Cancelled\n");
+		} else if (timedOut) {
 			result.append("Timed out after ").append(BASH_TIMEOUT.toSeconds()).append(" seconds\n");
 		}
-		result.append("exit_code: ").append(completed ? process.exitValue() : "timeout").append('\n');
+		result.append("exit_code: ");
+		if (completed) {
+			result.append(process.exitValue());
+		} else if (cancelled) {
+			result.append("cancelled");
+		} else {
+			result.append("timeout");
+		}
+		result.append('\n');
 		if (!stdout.text().isBlank()) {
 			result.append("stdout:\n").append(stdout.text()).append('\n');
 		}
@@ -175,6 +268,44 @@ public class AgentTools {
 			return text;
 		}
 		return text.substring(0, MAX_OUTPUT_CHARS) + "\n... truncated ...";
+	}
+
+	private static void destroyProcessTree(Process process) {
+		ProcessHandle handle = process.toHandle();
+		handle.descendants().forEach(child -> {
+			try {
+				child.destroyForcibly();
+			} catch (Exception ignored) {
+			}
+		});
+		try {
+			handle.destroyForcibly();
+		} catch (Exception ignored) {
+		}
+	}
+
+	private static class ManagedProcess {
+		private final Process process;
+		private final Set<ProcessHandle> descendants = ConcurrentHashMap.newKeySet();
+
+		private ManagedProcess(Process process) {
+			this.process = process;
+		}
+
+		private void rememberDescendants() {
+			process.toHandle().descendants().forEach(descendants::add);
+		}
+
+		private void destroy() {
+			rememberDescendants();
+			for (ProcessHandle descendant : descendants) {
+				try {
+					descendant.destroyForcibly();
+				} catch (Exception ignored) {
+				}
+			}
+			destroyProcessTree(process);
+		}
 	}
 
 	private static class StreamCollector implements Runnable {
