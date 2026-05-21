@@ -8,7 +8,10 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.json.JSONArray;
@@ -37,6 +40,10 @@ public class ElowbeAgent extends JinCanvas {
 	PrintWidget printWidget;
 	File directory = new File("agenttest");
 	private String systemPrompt = "";
+	/** Primary skill.md supplement loaded for the current working directory. */
+	private Skill primarySkill = Skill.parse("", null);
+	/** Additional skills discovered under .cursor/skills/ or skills/. */
+	private final List<Skill> discoveredSkills = new ArrayList<>();
 	private final JSONArray chatHistory = new JSONArray();
 	private volatile boolean agentBusy;
 	/** Total input + output tokens consumed by the active or latest agent run. */
@@ -72,6 +79,7 @@ public class ElowbeAgent extends JinCanvas {
 		commandInput.takeFocus();
 
 		loadSystemPrompt();
+		loadSkills();
 	}
 
 	private static File resolveSystemPromptFile() {
@@ -102,6 +110,31 @@ public class ElowbeAgent extends JinCanvas {
 			parent.mkdirs();
 		}
 		Files.writeString(SYSTEM_PROMPT_FILE.toPath(), systemPrompt, StandardCharsets.UTF_8);
+	}
+
+	private void loadSkills() {
+		discoveredSkills.clear();
+		primarySkill = Skill.parse("", null);
+
+		File primaryFile = Skill.resolvePrimarySkillFile(directory);
+		if (primaryFile.isFile()) {
+			try {
+				primarySkill = Skill.parse(primaryFile);
+			} catch (IOException e) {
+				printWidget.println("Failed to load skill file: " + e.getMessage());
+			}
+		}
+
+		Map<String, Skill> byPath = new LinkedHashMap<>();
+		for (File skillsRoot : Skill.skillDirectoryRoots(directory)) {
+			for (Skill skill : Skill.discoverInDirectory(skillsRoot)) {
+				byPath.put(skill.displayPath(), skill);
+			}
+		}
+		if (primarySkill.sourceFile != null && primarySkill.sourceFile.isFile()) {
+			byPath.remove(primarySkill.displayPath());
+		}
+		discoveredSkills.addAll(byPath.values());
 	}
 
 	private JSONObject buildUserMessage(String instruction) {
@@ -153,11 +186,39 @@ public class ElowbeAgent extends JinCanvas {
 	}
 
 	private String buildResolvedSystemPrompt() {
-		String osLine = "Host operating system: " + detectOperatingSystem();
-		if (systemPrompt == null || systemPrompt.isBlank()) {
-			return osLine;
+		StringBuilder resolved = new StringBuilder();
+		if (systemPrompt != null && !systemPrompt.isBlank()) {
+			resolved.append(systemPrompt);
 		}
-		return systemPrompt + "\n\n" + osLine;
+		appendSkillSupplement(resolved);
+		if (resolved.length() > 0) {
+			resolved.append("\n\n");
+		}
+		resolved.append("Host operating system: ").append(detectOperatingSystem());
+		return resolved.toString();
+	}
+
+	private void appendSkillSupplement(StringBuilder resolved) {
+		if (primarySkill.hasBody()) {
+			if (resolved.length() > 0) {
+				resolved.append("\n\n");
+			}
+			resolved.append("Skill supplement (").append(primarySkill.name).append("):\n");
+			resolved.append(primarySkill.body);
+		}
+
+		if (discoveredSkills.isEmpty()) {
+			return;
+		}
+
+		if (resolved.length() > 0) {
+			resolved.append("\n\n");
+		}
+		resolved.append("Available agent skills:\n");
+		resolved.append("When a user task matches a skill description, read that skill's file and follow its instructions.\n");
+		for (Skill skill : discoveredSkills) {
+			resolved.append(Skill.formatCatalogEntry(skill)).append('\n');
+		}
 	}
 
 	private String detectOperatingSystem() {
@@ -233,6 +294,7 @@ public class ElowbeAgent extends JinCanvas {
 			return;
 		}
 		directory = target;
+		loadSkills();
 	}
 
 	private void runLs(String path) {
@@ -438,6 +500,7 @@ public class ElowbeAgent extends JinCanvas {
 		}
 		case "model" -> openModelPicker();
 		case "system" -> handleSystemCommand(cmd);
+		case "skill" -> handleSkillCommand(cmd);
 		default -> printWidget.println("Unknown command: " + cmd.getName());
 		}
 	}
@@ -507,6 +570,65 @@ public class ElowbeAgent extends JinCanvas {
 		options.takeFocus();
 	}
 
+	private void handleSkillCommand(Command cmd) {
+		if (cmd.has("reload")) {
+			loadSkills();
+			printWidget.println("Skills reloaded for " + directory.getPath());
+			printPrimarySkillStatus();
+			printDiscoveredSkillStatus();
+			return;
+		}
+		if (cmd.has("show")) {
+			if (!primarySkill.hasBody()) {
+				printWidget.println("(no primary skill.md loaded)");
+			} else {
+				printWidget.println("Primary skill: " + primarySkill.name);
+				if (primarySkill.sourceFile != null) {
+					printWidget.println("File: " + primarySkill.sourceFile.getPath());
+				}
+				if (primarySkill.hasDescription()) {
+					printWidget.println("Description: " + primarySkill.description);
+				}
+				printWidget.println(primarySkill.body);
+			}
+			printDiscoveredSkillStatus();
+			return;
+		}
+		if (cmd.has("list")) {
+			printPrimarySkillStatus();
+			printDiscoveredSkillStatus();
+			return;
+		}
+		printWidget.println("Primary skill file: " + Skill.resolvePrimarySkillFile(directory).getPath());
+		printPrimarySkillStatus();
+		printDiscoveredSkillStatus();
+		printWidget.println("  /skill -show              show loaded skill content");
+		printWidget.println("  /skill -list              list primary and discovered skills");
+		printWidget.println("  /skill -reload            reload from disk");
+		printWidget.println("Skill directories: .cursor/skills/, skills/");
+	}
+
+	private void printPrimarySkillStatus() {
+		if (!primarySkill.hasBody()) {
+			printWidget.println("Primary skill: (none)");
+			return;
+		}
+		String path = primarySkill.sourceFile == null ? "unknown" : primarySkill.sourceFile.getPath();
+		printWidget.println("Primary skill: " + primarySkill.name + " (" + path + ", " + primarySkill.body.length()
+				+ " chars)");
+	}
+
+	private void printDiscoveredSkillStatus() {
+		if (discoveredSkills.isEmpty()) {
+			printWidget.println("Discovered skills: (none)");
+			return;
+		}
+		printWidget.println("Discovered skills:");
+		for (Skill skill : discoveredSkills) {
+			printWidget.println("  " + Skill.formatCatalogEntry(skill));
+		}
+	}
+
 	private void handleSystemCommand(Command cmd) {
 		if (cmd.has("reload")) {
 			loadSystemPrompt();
@@ -560,6 +682,7 @@ public class ElowbeAgent extends JinCanvas {
 			printWidget.println("/clear             clear chat history");
 			printWidget.println("/model             choose Ollama model");
 			printWidget.println("/system            system prompt (" + SYSTEM_PROMPT_FILE.getPath() + ")");
+			printWidget.println("/skill             skill.md supplement and .cursor/skills/");
 			printWidget.println("Ctrl+Shift+C      cancel the running agent and its process");
 			printWidget.println("cd [path]          change directory (~ for home)");
 			printWidget.println("ls [path]          list directory contents");
@@ -572,6 +695,7 @@ public class ElowbeAgent extends JinCanvas {
 		printWidget.println("  /help -commands");
 		printWidget.println("  /model");
 		printWidget.println("  /system -show");
+		printWidget.println("  /skill -list");
 	}
 
 	public void tick(float delta) {
