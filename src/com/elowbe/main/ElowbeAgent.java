@@ -50,11 +50,17 @@ public class ElowbeAgent extends JinCanvas {
 	public volatile long agentTokenCount;
 	/** Total input + output tokens consumed across all agent runs in this session. */
 	public volatile long totalAgentTokenCount;
+	private long tokensAtRunStart;
+	private long runTokenTotal;
+	private long currentStreamTokenTotal;
+	private volatile boolean subtaskActive;
 	private final AtomicBoolean agentCancelRequested = new AtomicBoolean();
 	private volatile Thread agentThread;
 	private OptionsWidget modelPickerWidget;
 	private boolean controlHeld;
 	private boolean spaceHeld;
+	/** Photos dropped onto the window, sent with the next agent message. */
+	private final List<File> attachedPhotos = new ArrayList<>();
 
 	public static void main(String[] args) {
 		// Makes a window with 1280x720 pixel resolution and a console of 40 columns and
@@ -71,6 +77,7 @@ public class ElowbeAgent extends JinCanvas {
 		// Create widgets here.
 		commandInput = new InputWidget("", 0, 0, JinConsole.getColumns(), 1);
 		commandInput.elevation = 1;
+		commandInput.commandHistoryEnabled = true;
 		commandInput.onNewLine = () -> {
 
 			runCommand(commandInput.value);
@@ -137,10 +144,14 @@ public class ElowbeAgent extends JinCanvas {
 		discoveredSkills.addAll(byPath.values());
 	}
 
-	private JSONObject buildUserMessage(String instruction) {
-		return new JSONObject()
+	private JSONObject buildUserMessage(String instruction, JSONArray images) {
+		JSONObject message = new JSONObject()
 				.put("role", "user")
 				.put("content", buildProjectAwareInstruction(instruction));
+		if (images != null && images.length() > 0) {
+			message.put("images", images);
+		}
+		return message;
 	}
 
 	private String buildProjectAwareInstruction(String instruction) {
@@ -230,22 +241,44 @@ public class ElowbeAgent extends JinCanvas {
 
 	public void runCommand(String line) {
 		line = line == null ? "" : line.trim();
-		if (line.isEmpty()) {
+		if (line.isEmpty() && attachedPhotos.isEmpty()) {
 			return;
 		}
-		printWidget.setColor(Colors.lightgray);
+		commandInput.addCommandToHistory(line);
+		printWidget.setColor(Colors.white);
 
-		printWidget.println("> " + line);
+		String displayLine = line.isEmpty() ? "(photo attachment)" : line;
+		if (!attachedPhotos.isEmpty()) {
+			displayLine += " [" + attachedPhotos.size() + " photo(s)]";
+		}
+		printWidget.println("> " + displayLine);
 		printWidget.setColor(Colors.white);
 		commandInput.setValue("");
 
 		if (line.startsWith("/")) {
 			runSlashCommand(line.substring(1).trim());
-		} else if (!runTerminalCommand(line)) {
-			printWidget.setColor(Colors.blue);
-
-			sendAgentInstruction(line);
+			return;
 		}
+		if (runTerminalCommand(line)) {
+			return;
+		}
+
+		List<File> photosToSend = takeAttachedPhotos();
+		JSONArray images;
+		try {
+			images = encodePhotos(photosToSend);
+		} catch (IOException e) {
+			printWidget.println("Failed to read attached photo: " + e.getMessage());
+			attachedPhotos.addAll(photosToSend);
+			return;
+		}
+
+		printWidget.setColor(Colors.blue);
+		String instruction = line;
+		if (instruction.isEmpty() && images.length() > 0) {
+			instruction = "Please analyze the attached image(s).";
+		}
+		sendAgentInstruction(instruction, images);
 	}
 
 	private boolean runTerminalCommand(String line) {
@@ -379,17 +412,25 @@ public class ElowbeAgent extends JinCanvas {
 	}
 
 	private void sendAgentInstruction(String instruction) {
+		sendAgentInstruction(instruction, new JSONArray());
+	}
+
+	private void sendAgentInstruction(String instruction, JSONArray images) {
 		if (agentBusy) {
 			printWidget.println("Agent is still responding. Please wait.");
 			return;
 		}
 
-		JSONObject userMessage = buildUserMessage(instruction);
+		JSONObject userMessage = buildUserMessage(instruction, images);
 
 		JSONArray request = buildChatRequest(userMessage);
 		int turnStart = request.length() - 1;
 
 		agentTokenCount = 0;
+		tokensAtRunStart = totalAgentTokenCount;
+		runTokenTotal = 0;
+		currentStreamTokenTotal = 0;
+		subtaskActive = false;
 		agentBusy = true;
 		agentCancelRequested.set(false);
 
@@ -400,23 +441,12 @@ public class ElowbeAgent extends JinCanvas {
 				printWidget.print("<#green>");
 				printWidget.setColor(Colors.green);
 				AgentRunner.run(request, directory, token -> {
-					printWidget.setColor(Colors.green);
-					printWidget.print(token);
+					//printWidget.setColor(Colors.green);
+					//printWidget.print(token);
 				}, thinking -> {
-					printWidget.setColor(Colors.gray);
+					printWidget.setColor(subtaskActive ? Colors.darkblue : Colors.lightgray);
 					printWidget.print(thinking);
-				}, (name, args, result) -> {
-					printWidget.println();
-					printWidget.print("<#yellow>");
-					printWidget.setColor(Colors.yellow);
-					printWidget.println(AgentRunner.formatToolCall(name, args));
-					printWidget.setColor(Colors.lightgray);
-					for (String line : result.split("\n", -1)) {
-						printWidget.println(line);
-					}
-					printWidget.print("<#green>");
-					printWidget.setColor(Colors.green);
-				}, this::addAgentTokenUsage,
+				}, (name, args, result) -> logToolActivity(name, args, result), this::addAgentTokenUsage,
 						() -> agentCancelRequested.get() || Thread.currentThread().isInterrupted());
 
 				if (!agentCancelRequested.get()) {
@@ -442,6 +472,7 @@ public class ElowbeAgent extends JinCanvas {
 			} finally {
 				OllamaAPI.model = previousModel;
 				agentBusy = false;
+				subtaskActive = false;
 				agentCancelRequested.set(false);
 				if (agentThread == Thread.currentThread()) {
 					agentThread = null;
@@ -452,14 +483,65 @@ public class ElowbeAgent extends JinCanvas {
 		thread.start();
 	}
 
+	private void logToolActivity(String name, JSONObject args, String result) {
+		printWidget.println();
+		boolean subtaskEvent = name.startsWith("subtask.");
+		if ("subtask.start".equals(name)) {
+			subtaskActive = true;
+			printWidget.print("<#lightblue>");
+			printWidget.setColor(Colors.lightblue);
+			printWidget.println(AgentRunner.formatToolAction(name, args));
+		} else if ("subtask.finish".equals(name)) {
+			printWidget.setColor(Colors.lightblue);
+			printWidget.println(AgentRunner.formatToolAction(name, args));
+			String summary = AgentRunner.formatToolResultSummary(name, result);
+			if (!summary.isBlank()) {
+				printWidget.setColor(Colors.lightgray);
+				printWidget.println(summary);
+			}
+			subtaskActive = false;
+		} else if (subtaskEvent) {
+			printWidget.print("<#lightblue>");
+			printWidget.setColor(Colors.lightblue);
+			printWidget.println(AgentRunner.formatToolAction(name, args));
+			String summary = AgentRunner.formatToolResultSummary(name, result);
+			if (!summary.isBlank()) {
+				printWidget.setColor(Colors.lightgray);
+				for (String line : summary.split("\n", -1)) {
+					printWidget.println(line);
+				}
+			}
+		} else {
+			printWidget.print("<#yellow>");
+			printWidget.setColor(Colors.yellow);
+			printWidget.println(AgentRunner.formatToolAction(name, args));
+			String summary = AgentRunner.formatToolResultSummary(name, result);
+			if (!summary.isBlank()) {
+				printWidget.setColor(Colors.lightgray);
+				for (String line : summary.split("\n", -1)) {
+					printWidget.println(line);
+				}
+			}
+		}
+		printWidget.print("<#green>");
+		printWidget.setColor(Colors.green);
+	}
+
 	private synchronized void addAgentTokenUsage(JSONObject usage) {
 		if (usage == null) {
 			return;
 		}
+		boolean streaming = usage.optBoolean("__streaming", false);
 		long totalTokens = usage.optLong("total_tokens",
 				usage.optLong("prompt_tokens", 0) + usage.optLong("completion_tokens", 0));
-		agentTokenCount += totalTokens;
-		totalAgentTokenCount += totalTokens;
+		if (streaming) {
+			currentStreamTokenTotal = totalTokens;
+		} else {
+			runTokenTotal += totalTokens;
+			currentStreamTokenTotal = 0;
+		}
+		agentTokenCount = runTokenTotal + currentStreamTokenTotal;
+		totalAgentTokenCount = tokensAtRunStart + agentTokenCount;
 	}
 
 	private boolean cancelAgent() {
@@ -497,6 +579,9 @@ public class ElowbeAgent extends JinCanvas {
 			printWidget.clear();
 			agentTokenCount = 0;
 			totalAgentTokenCount = 0;
+			tokensAtRunStart = 0;
+			runTokenTotal = 0;
+			currentStreamTokenTotal = 0;
 		}
 		case "model" -> openModelPicker();
 		case "system" -> handleSystemCommand(cmd);
@@ -621,6 +706,10 @@ public class ElowbeAgent extends JinCanvas {
 	private void printDiscoveredSkillStatus() {
 		if (discoveredSkills.isEmpty()) {
 			printWidget.println("Discovered skills: (none)");
+			printWidget.println("Searched skill roots:");
+			for (File root : Skill.skillDirectoryRoots(directory)) {
+				printWidget.println("  " + root.getPath());
+			}
 			return;
 		}
 		printWidget.println("Discovered skills:");
@@ -684,6 +773,7 @@ public class ElowbeAgent extends JinCanvas {
 			printWidget.println("/system            system prompt (" + SYSTEM_PROMPT_FILE.getPath() + ")");
 			printWidget.println("/skill             skill.md supplement and .cursor/skills/");
 			printWidget.println("Ctrl+Shift+C      cancel the running agent and its process");
+			printWidget.println("Drag and drop      attach photos to the next agent message");
 			printWidget.println("cd [path]          change directory (~ for home)");
 			printWidget.println("ls [path]          list directory contents");
 			printWidget.println("mkdir [-p] dir     create directory");
@@ -695,7 +785,51 @@ public class ElowbeAgent extends JinCanvas {
 		printWidget.println("  /help -commands");
 		printWidget.println("  /model");
 		printWidget.println("  /system -show");
-		printWidget.println("  /skill -list");
+			printWidget.println("  /skill -list");
+	}
+
+	@Override
+	public boolean onFilesDropped(List<File> files) {
+		if (files == null || files.isEmpty()) {
+			return false;
+		}
+		int added = 0;
+		for (File file : files) {
+			if (isImageFile(file)) {
+				attachedPhotos.add(file);
+				added++;
+			}
+		}
+		if (added == 0) {
+			printWidget.println("Drop ignored: supported image types are .jpg, .jpeg, .png, .gif, .webp, .bmp");
+			return false;
+		}
+		printWidget.println("Attached " + added + " photo(s). Press Enter to send with your message.");
+		commandInput.takeFocus();
+		return true;
+	}
+
+	private static boolean isImageFile(File file) {
+		if (file == null || !file.isFile()) {
+			return false;
+		}
+		String name = file.getName().toLowerCase(Locale.ROOT);
+		return name.endsWith(".jpg") || name.endsWith(".jpeg") || name.endsWith(".png")
+				|| name.endsWith(".gif") || name.endsWith(".webp") || name.endsWith(".bmp");
+	}
+
+	private List<File> takeAttachedPhotos() {
+		List<File> photos = new ArrayList<>(attachedPhotos);
+		attachedPhotos.clear();
+		return photos;
+	}
+
+	private JSONArray encodePhotos(List<File> photos) throws IOException {
+		JSONArray images = new JSONArray();
+		for (File photo : photos) {
+			images.put(OllamaAPI.encodeImageToBase64(photo.getAbsolutePath()));
+		}
+		return images;
 	}
 
 	public void tick(float delta) {
@@ -754,8 +888,19 @@ public class ElowbeAgent extends JinCanvas {
 
 		t2d.drawString(" " + truncatePath(directory.getAbsolutePath()) + " ", 2,
 				commandInput.row + 2 + commandInput.height - 4);
-		t2d.drawString(" " + agentModel +" ["+ totalAgentTokenCount + " tokens : "+tokenCost(totalAgentTokenCount)+ "] ", 2,
-				0);
+		if (!attachedPhotos.isEmpty()) {
+			t2d.setColor(Colors.lightblue);
+			t2d.drawString(" " + attachedPhotos.size() + " photo(s) ", JinConsole.getColumns() - 14,
+					commandInput.row + 2 + commandInput.height - 4);
+		}
+		String tokenMeter;
+		if (agentBusy) {
+			tokenMeter = agentModel + " [" + agentTokenCount + " run | " + totalAgentTokenCount + " session : "
+					+ tokenCost(totalAgentTokenCount) + "]";
+		} else {
+			tokenMeter = agentModel + " [" + totalAgentTokenCount + " tokens : " + tokenCost(totalAgentTokenCount) + "]";
+		}
+		t2d.drawString(" " + tokenMeter + " ", 2, 0);
 	}
 	
 	public String tokenCost(float agentTokenCount) {

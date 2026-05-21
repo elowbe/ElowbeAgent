@@ -199,8 +199,27 @@ public final class Skill {
 
 	public static List<File> skillDirectoryRoots(File workingDirectory) {
 		List<File> roots = new ArrayList<>();
-		addSkillDirectoryRoot(roots, new File(workingDirectory, ".cursor/skills"));
-		addSkillDirectoryRoot(roots, new File(workingDirectory, "skills"));
+		File start = workingDirectory == null ? new File(".") : workingDirectory;
+		try {
+			start = start.getCanonicalFile();
+		} catch (IOException ignored) {
+			start = start.getAbsoluteFile();
+		}
+
+		// Walk up from the working directory so project-level skills/ is found even when
+		// the agent cwd is a subdirectory like agenttest/.
+		File current = start;
+		for (int depth = 0; depth < 6 && current != null; depth++) {
+			addSkillDirectoryRoot(roots, new File(current, ".cursor/skills"));
+			addSkillDirectoryRoot(roots, new File(current, "skills"));
+			addSkillDirectoryRoot(roots, new File(current, "src/skills"));
+			addSkillDirectoryRoot(roots, new File(current, "src/.cursor/skills"));
+			current = current.getParentFile();
+		}
+
+		// Fallback install candidates relative to the JVM working directory.
+		addSkillDirectoryRoot(roots, new File("skills"));
+		addSkillDirectoryRoot(roots, new File("src/skills"));
 		addSkillDirectoryRoot(roots, new File("src/.cursor/skills"));
 		addSkillDirectoryRoot(roots, new File(".cursor/skills"));
 		return roots;

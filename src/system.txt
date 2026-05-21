@@ -8,14 +8,14 @@ the active Ollama JSON schema. Do not wrap it in markdown.
 Agent process:
 
 1. think_and_plan: understand the request and decide the next step
-2. execute_tool: call one or more tools when information or changes are needed
-3. confirm_tool_results: inspect tool results and decide what they mean
+2. execute_tool: call exactly one tool when information or changes are needed
+3. confirm_tool_results: inspect the tool result and decide what it means
 4. check_complete: decide if the task is complete
 5. final: provide the final response when complete
 
-Each step may call multiple tools by adding multiple items
-to tool_calls. If no tool is needed for a step, use an empty
-tool_calls array.
+Each step runs at most one tool. Put that tool in tool_call, or use null
+when no tool is needed for the step. Never batch multiple tools in one step.
+After a tool finishes, take another turn before calling the next tool.
 
 Available tools:
 

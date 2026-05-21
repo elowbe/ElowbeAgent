@@ -10,6 +10,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.time.Duration;
 import java.util.Locale;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
@@ -130,7 +131,7 @@ public class AgentTools {
 				new JSONObject().put("command", command)
 						.put("workingDirectory", workingDirectory == null ? "(null)" : workingDirectory.getPath()));
 		// #endregion
-		Duration timeout = resolveBashTimeout(arguments);
+		Optional<Duration> timeout = resolveBashTimeout(arguments);
 		if (cancelRequested.getAsBoolean()) {
 			return ToolResult.output("bash: cancelled");
 		}
@@ -159,7 +160,7 @@ public class AgentTools {
 		boolean completed = false;
 		boolean timedOut = false;
 		boolean cancelled = false;
-		long deadline = System.nanoTime() + timeout.toNanos();
+		Long deadline = timeout.map(value -> System.nanoTime() + value.toNanos()).orElse(null);
 		try {
 			while (true) {
 				managedProcess.rememberDescendants();
@@ -172,7 +173,7 @@ public class AgentTools {
 					completed = true;
 					break;
 				}
-				if (System.nanoTime() >= deadline) {
+				if (deadline != null && System.nanoTime() >= deadline) {
 					timedOut = true;
 					managedProcess.destroy();
 					break;
@@ -190,8 +191,8 @@ public class AgentTools {
 		StringBuilder result = new StringBuilder();
 		if (cancelled) {
 			result.append("Cancelled\n");
-		} else if (timedOut) {
-			result.append("Timed out after ").append(timeout.toSeconds())
+		} else if (timedOut && timeout.isPresent()) {
+			result.append("Timed out after ").append(timeout.get().toSeconds())
 					.append(" seconds while the process was still alive\n");
 		}
 		if (!stdout.text().isBlank()) {
@@ -214,9 +215,9 @@ public class AgentTools {
 		return ToolResult.output(truncate(result.toString().trim()));
 	}
 
-	private static Duration resolveBashTimeout(JSONObject arguments) {
+	private static Optional<Duration> resolveBashTimeout(JSONObject arguments) {
 		if (arguments == null || !arguments.has("timeout_seconds") || arguments.isNull("timeout_seconds")) {
-			return DEFAULT_BASH_TIMEOUT;
+			return Optional.of(DEFAULT_BASH_TIMEOUT);
 		}
 		Object raw = arguments.get("timeout_seconds");
 		double seconds;
@@ -226,14 +227,17 @@ public class AgentTools {
 			try {
 				seconds = Double.parseDouble(String.valueOf(raw).trim());
 			} catch (NumberFormatException e) {
-				return DEFAULT_BASH_TIMEOUT;
+				return Optional.of(DEFAULT_BASH_TIMEOUT);
 			}
 		}
-		if (!Double.isFinite(seconds) || seconds <= 0) {
-			return DEFAULT_BASH_TIMEOUT;
+		if (!Double.isFinite(seconds) || seconds < 0) {
+			return Optional.of(DEFAULT_BASH_TIMEOUT);
+		}
+		if (seconds == 0) {
+			return Optional.empty();
 		}
 		long millis = Math.max(1L, Math.round(seconds * 1000.0));
-		return Duration.ofMillis(millis);
+		return Optional.of(Duration.ofMillis(millis));
 	}
 
 	private static ToolResult run(JSONObject arguments, File workingDirectory, BooleanSupplier cancelRequested)

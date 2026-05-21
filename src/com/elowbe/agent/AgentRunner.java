@@ -81,6 +81,9 @@ public class AgentRunner {
 			write: {"path":"file","content":"new file contents"}
 			done: {"response":"final result for the master agent"}
 
+			You must call exactly one tool per step. After each tool result returns,
+			decide the next single step and call at most one more tool.
+			Use tool_call for the one tool to run, or null when no tool is needed.
 			You must call at least one non-done tool before done so the master agent has
 			evidence that this worker actually ran. For code tasks, read relevant files,
 			run an inspection command, edit files, write files, or run a verification command.
@@ -190,13 +193,33 @@ public class AgentRunner {
 					new OllamaAPI.ChatStreamListener() {
 						@Override
 						public void onToken(String token) {
+							if (token == null || token.isEmpty()) {
+								return;
+							}
+							if (subtaskDepth > 0) {
+								if (thinkingSink != null) {
+									thinkingSink.accept(prefixSubtaskOutput(token));
+								}
+							} else if (tokenSink != null) {
+								tokenSink.accept(token);
+							}
 						}
 
 						@Override
 						public void onThinking(String token) {
-							if (thinkingSink != null) {
+							if (token == null || token.isEmpty() || thinkingSink == null) {
+								return;
+							}
+							if (subtaskDepth > 0) {
+								thinkingSink.accept(prefixSubtaskOutput(token));
+							} else {
 								thinkingSink.accept(token);
 							}
+						}
+
+						@Override
+						public void onUsage(JSONObject usage) {
+							emitStreamingUsage(usage, usageSink);
 						}
 					}, null, cancelRequested);
 			emitUsage(assistantMessage, usageSink);
@@ -216,30 +239,30 @@ public class AgentRunner {
 			JSONArray toolCalls = step.optJSONArray("tool_calls");
 			boolean completedByTool = false;
 			String toolFinalResponse = "";
-			if (toolCalls != null && toolCalls.length() > 0) {
-				for (int i = 0; i < toolCalls.length(); i++) {
-					JSONObject call = toolCalls.optJSONObject(i);
-					if (call == null) {
-						appendToolResult(messages, "unknown", new JSONObject(), "Tool error: invalid tool call");
-						continue;
-					}
+			JSONObject call = extractToolCall(step);
+			if (call != null) {
+				if (toolCalls != null && toolCalls.length() > 1) {
+					appendUserInstruction(messages,
+							"Only one tool is allowed per step. You sent "
+									+ toolCalls.length()
+									+ " tools; only the first was executed. Call one tool, wait for the result, then continue.");
+				}
 
-					String name = call.optString("name", "");
-					JSONObject arguments = normalizeArguments(call.opt("arguments"));
-					throwIfCancelled(cancelRequested);
-					ToolResult result = executeTool(name, arguments, workingDirectory, cancelRequested, subtaskDepth,
-							thinkingSink, toolSink, usageSink);
-					throwIfCancelled(cancelRequested);
-					if (toolSink != null) {
-						toolSink.accept(name, arguments, result.getOutput());
-					}
-					appendToolResult(messages, name, arguments, result.getOutput());
-					guard.observe(name, arguments, result.getOutput());
+				String name = call.optString("name", "");
+				JSONObject arguments = normalizeArguments(call.opt("arguments"));
+				throwIfCancelled(cancelRequested);
+				ToolResult result = executeTool(name, arguments, workingDirectory, cancelRequested, subtaskDepth,
+						thinkingSink, toolSink, usageSink);
+				throwIfCancelled(cancelRequested);
+				if (toolSink != null) {
+					toolSink.accept(name, arguments, result.getOutput());
+				}
+				appendToolResult(messages, name, arguments, result.getOutput());
+				guard.observe(name, arguments, result.getOutput());
 
-					if (result.isComplete()) {
-						completedByTool = true;
-						toolFinalResponse = result.getFinalResponse();
-					}
+				if (result.isComplete()) {
+					completedByTool = true;
+					toolFinalResponse = result.getFinalResponse();
 				}
 				if (completedByTool) {
 					String response = toolFinalResponse.isBlank() ? step.optString("response", "") : toolFinalResponse;
@@ -250,8 +273,8 @@ public class AgentRunner {
 							continue;
 						}
 					}
-					if (!response.isBlank() && tokenSink != null) {
-						tokenSink.accept(response);
+					if (!response.isBlank()) {
+						emitFinalResponse(response, tokenSink, subtaskDepth);
 					}
 					return;
 				}
@@ -267,14 +290,13 @@ public class AgentRunner {
 						continue;
 					}
 				}
-				if (!response.isBlank() && tokenSink != null) {
-					tokenSink.accept(response);
-				}
+				emitFinalResponse(response, tokenSink, subtaskDepth);
 				return;
 			}
 
 			appendUserInstruction(messages,
-					"No tool was called and the task is not complete. Continue with the next required step.");
+					"No tool was called and the task is not complete. Continue with the next required step. "
+							+ "Call exactly one tool per step, wait for its result, then decide the next step.");
 		}
 
 		if (tokenSink != null) {
@@ -313,12 +335,7 @@ public class AgentRunner {
 		StringBuilder evidence = new StringBuilder();
 		String result;
 		try {
-			result = runSubtask(task, context, workingDirectory, cancelRequested,
-					token -> {
-						if (thinkingSink != null) {
-							thinkingSink.accept(prefixSubtaskOutput(token));
-						}
-					},
+			result = runSubtask(task, context, workingDirectory, cancelRequested, thinkingSink,
 					(toolName, toolArguments, toolResult) -> {
 						if (!"done".equals(toolName)) {
 							evidenceToolCount[0]++;
@@ -367,7 +384,232 @@ public class AgentRunner {
 	}
 
 	public static String formatToolCall(String name, JSONObject arguments) {
-		return "tool: " + name + "(" + (arguments == null ? "{}" : arguments.toString()) + ")";
+		return formatToolAction(name, arguments);
+	}
+
+	/** Human-readable one-line description of a tool invocation (no raw JSON dumps). */
+	public static String formatToolAction(String name, JSONObject arguments) {
+		if (name == null) {
+			name = "";
+		}
+		JSONObject args = arguments == null ? new JSONObject() : arguments;
+		return switch (name) {
+		case "read" -> "→ read " + shortPath(first(args, "path", "file"));
+		case "write" -> {
+			String path = shortPath(first(args, "path", "file"));
+			int chars = first(args, "content", "text").length();
+			yield "→ write " + path + " (" + chars + " chars)";
+		}
+		case "edit" -> {
+			String path = shortPath(first(args, "path", "file"));
+			int oldLen = first(args, "old", "old_text", "target").length();
+			int newLen = first(args, "new", "new_text", "replacement").length();
+			yield "→ edit " + path + " (" + oldLen + " → " + newLen + " chars)";
+		}
+		case "bash" -> "→ bash: " + truncateInline(first(args, "command", "cmd"), 100);
+		case "run" -> {
+			String cmd = first(args, "command", "cmd");
+			yield cmd.isBlank() ? "→ run (project script)" : "→ run: " + truncateInline(cmd, 100);
+		}
+		case "done" -> "→ done";
+		case "subtask" -> "→ subtask: " + truncateInline(first(args, "task", "instruction", "goal"), 120);
+		case "subtask.start" -> "── subagent: " + truncateInline(args.optString("task", "?"), 120) + " ──";
+		case "subtask.finish" -> "── subagent done ──";
+		default -> {
+			if (name.startsWith("subtask.")) {
+				yield "  subagent " + formatToolAction(name.substring("subtask.".length()), args);
+			}
+			yield "→ " + name;
+		}
+		};
+	}
+
+	/** Concise summary of a tool result for console logging (no file/command dumps). */
+	public static String formatToolResultSummary(String name, String result) {
+		if (name == null) {
+			name = "";
+		}
+		if ("done".equals(name)) {
+			return "";
+		}
+		if (result == null || result.isBlank()) {
+			return "  (no output)";
+		}
+		if (name.startsWith("subtask.")) {
+			return formatToolResultSummary(name.substring("subtask.".length()), result);
+		}
+		if ("subtask.finish".equals(name)) {
+			return "  " + truncateInline(result, 120);
+		}
+		if (looksLikeToolError(name, result)) {
+			return "  ✗ " + truncateInline(firstNonBlankLine(result), 160);
+		}
+		return switch (name) {
+		case "read" -> formatReadSummary(result);
+		case "write", "edit" -> "  ✓ " + truncateInline(firstNonBlankLine(result), 160);
+		case "bash", "run" -> formatCommandOutputSummary(result);
+		case "subtask" -> formatSubtaskSummary(result);
+		default -> formatGenericSummary(result);
+		};
+	}
+
+	private static boolean looksLikeToolError(String name, String result) {
+		String line = firstNonBlankLine(result);
+		if (line.startsWith("Tool error:")) {
+			return true;
+		}
+		return switch (name) {
+		case "read" -> line.startsWith("read:") && !line.startsWith("read: ");
+		case "edit" -> line.startsWith("edit:") && !line.startsWith("edit: updated");
+		case "write" -> line.startsWith("write:") && !line.startsWith("write: wrote");
+		case "bash" -> line.startsWith("bash:") && !line.equals("bash: cancelled");
+		case "run" -> line.startsWith("run:") && line.contains("error");
+		default -> false;
+		};
+	}
+
+	private static String formatReadSummary(String result) {
+		int lines = countLines(result);
+		return "  ✓ " + lines + " lines, " + result.length() + " chars";
+	}
+
+	private static String formatCommandOutputSummary(String result) {
+		String status;
+		if (result.startsWith("Cancelled")) {
+			status = "cancelled";
+		} else if (result.startsWith("Timed out")) {
+			status = "timed out";
+		} else {
+			status = null;
+		}
+
+		String stdout = extractSection(result, "stdout:\n", "stderr:\n");
+		String stderr = extractSection(result, "stderr:\n", null);
+		if (result.startsWith("run_command:")) {
+			stdout = extractSection(result, "run_output:\n", null);
+			if (stdout.isEmpty()) {
+				stdout = extractSection(result, "run_output_head:\n", "run_output_tail:");
+			}
+			stderr = "";
+		}
+
+		StringBuilder summary = new StringBuilder("  ✓ ");
+		if (status != null) {
+			summary.append(status);
+		} else {
+			summary.append(countLines(stdout)).append(" stdout lines");
+			if (!stderr.isBlank()) {
+				summary.append(", ").append(countLines(stderr)).append(" stderr lines");
+			}
+		}
+
+		String errLine = firstNonBlankLine(stderr);
+		if (errLine != null) {
+			summary.append("\n  ! ").append(truncateInline(errLine, 140));
+		} else if (status == null && stdout.isBlank() && stderr.isBlank()) {
+			String preview = firstNonBlankLine(result);
+			if (preview != null && !preview.startsWith("run_command:")) {
+				summary.append(": ").append(truncateInline(preview, 140));
+			}
+		}
+		return summary.toString();
+	}
+
+	private static String formatSubtaskSummary(String result) {
+		String status = extractMarkerLine(result, "SUBTASK_STATUS:");
+		String toolCalls = extractMarkerLine(result, "SUBTASK_TOOL_CALLS:");
+		StringBuilder summary = new StringBuilder("  ✓ subtask");
+		if (!status.isBlank()) {
+			summary.append(' ').append(status.toLowerCase(Locale.ROOT));
+		}
+		if (!toolCalls.isBlank()) {
+			summary.append(" (").append(toolCalls).append(" tools)");
+		}
+		return summary.toString();
+	}
+
+	private static String formatGenericSummary(String result) {
+		int lines = countLines(result);
+		if (lines <= 1 && result.length() <= 160) {
+			return "  ✓ " + result.trim();
+		}
+		return "  ✓ " + lines + " lines, " + result.length() + " chars";
+	}
+
+	private static String extractSection(String text, String startMarker, String endMarker) {
+		int start = text.indexOf(startMarker);
+		if (start < 0) {
+			return "";
+		}
+		start += startMarker.length();
+		int end = endMarker == null ? text.length() : text.indexOf(endMarker, start);
+		if (end < 0) {
+			end = text.length();
+		}
+		return text.substring(start, end).trim();
+	}
+
+	private static String extractMarkerLine(String text, String marker) {
+		int idx = text.indexOf(marker);
+		if (idx < 0) {
+			return "";
+		}
+		int lineEnd = text.indexOf('\n', idx);
+		String line = lineEnd < 0 ? text.substring(idx) : text.substring(idx, lineEnd);
+		return line.substring(marker.length()).trim();
+	}
+
+	private static int countLines(String text) {
+		if (text == null || text.isBlank()) {
+			return 0;
+		}
+		return text.split("\n", -1).length;
+	}
+
+	private static String truncateInline(String text, int maxChars) {
+		if (text == null) {
+			return "";
+		}
+		String oneLine = text.replace('\n', ' ').replace('\r', ' ').trim();
+		if (oneLine.length() <= maxChars) {
+			return oneLine;
+		}
+		return oneLine.substring(0, maxChars - 1) + "…";
+	}
+
+	private static String shortPath(String path) {
+		if (path == null || path.isBlank()) {
+			return "(no path)";
+		}
+		path = path.replace('\\', '/');
+		if (path.endsWith("/")) {
+			path = path.substring(0, path.length() - 1);
+		}
+		String[] parts = path.split("/");
+		if (parts.length <= 2) {
+			return path;
+		}
+		return ".../" + parts[parts.length - 2] + "/" + parts[parts.length - 1];
+	}
+
+	private static JSONObject extractToolCall(JSONObject step) {
+		if (step == null) {
+			return null;
+		}
+		if (step.has("tool_call") && !step.isNull("tool_call")) {
+			JSONObject call = step.optJSONObject("tool_call");
+			if (call != null && !call.optString("name", "").isBlank()) {
+				return call;
+			}
+		}
+		JSONArray legacyCalls = step.optJSONArray("tool_calls");
+		if (legacyCalls != null && legacyCalls.length() > 0) {
+			JSONObject call = legacyCalls.optJSONObject(0);
+			if (call != null && !call.optString("name", "").isBlank()) {
+				return call;
+			}
+		}
+		return null;
 	}
 
 	private static JSONObject parseStep(String content) {
@@ -493,13 +735,34 @@ public class AgentRunner {
 		messages.put(message);
 	}
 
+	private static void emitFinalResponse(String response, TokenSink tokenSink, int subtaskDepth) {
+		if (response.isBlank() || tokenSink == null) {
+			return;
+		}
+		// Main agent output is already streamed token-by-token; subtasks collect a summary.
+		if (subtaskDepth > 0) {
+			tokenSink.accept(response);
+		}
+	}
+
+	private static void emitStreamingUsage(JSONObject usage, UsageSink usageSink) {
+		if (usageSink == null || usage == null || usage.length() == 0) {
+			return;
+		}
+		JSONObject copy = new JSONObject(usage.toString());
+		copy.put("__streaming", true);
+		usageSink.accept(copy);
+	}
+
 	private static void emitUsage(JSONObject assistantMessage, UsageSink usageSink) {
 		if (usageSink == null || assistantMessage == null) {
 			return;
 		}
 		JSONObject usage = assistantMessage.optJSONObject("usage");
 		if (usage != null && usage.length() > 0) {
-			usageSink.accept(usage);
+			JSONObject copy = new JSONObject(usage.toString());
+			copy.put("__streaming", false);
+			usageSink.accept(copy);
 		}
 	}
 
