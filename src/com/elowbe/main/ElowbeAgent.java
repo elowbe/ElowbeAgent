@@ -17,6 +17,7 @@ import org.json.JSONObject;
 import com.elowbe.agent.AgentRunner;
 import com.elowbe.commands.Command;
 import com.elowbe.tools.AgentTools;
+import com.jinteractive.gui.Settings;
 import com.jinteractive.main.Colors;
 
 import lib.console.main.JinCanvas;
@@ -116,6 +117,8 @@ public class ElowbeAgent extends JinCanvas {
 		content.append("- Current directory: ").append(profile.currentDirectoryPath()).append('\n');
 		content.append("- Java and Maven are the default stack unless the user explicitly requested another language, build tool, or framework.\n");
 		content.append("- Application type guidance: ").append(profile.frameworkGuidance).append('\n');
+		content.append("- HARD COMPLETION RULE: before finishing, ensure run.sh and run.bat exist in the current directory, ");
+		content.append("run the program with the script for the current OS, and include a run output analysis with key stdout/stderr findings.\n");
 		if (profile.mavenProjectRoot == null) {
 			content.append("- Maven project check: no pom.xml was found in the current directory or any parent directory.\n");
 			if (profile.usesJavaMavenDefault) {
@@ -135,10 +138,11 @@ public class ElowbeAgent extends JinCanvas {
 
 	private JSONArray buildChatRequest(JSONObject userMessage) {
 		JSONArray request = new JSONArray();
-		if (systemPrompt != null && !systemPrompt.isBlank()) {
+		String resolvedSystemPrompt = buildResolvedSystemPrompt();
+		if (!resolvedSystemPrompt.isBlank()) {
 			JSONObject systemMessage = new JSONObject();
 			systemMessage.put("role", "system");
-			systemMessage.put("content", systemPrompt);
+			systemMessage.put("content", resolvedSystemPrompt);
 			request.put(systemMessage);
 		}
 		for (int i = 0; i < chatHistory.length(); i++) {
@@ -146,6 +150,21 @@ public class ElowbeAgent extends JinCanvas {
 		}
 		request.put(userMessage);
 		return request;
+	}
+
+	private String buildResolvedSystemPrompt() {
+		String osLine = "Host operating system: " + detectOperatingSystem();
+		if (systemPrompt == null || systemPrompt.isBlank()) {
+			return osLine;
+		}
+		return systemPrompt + "\n\n" + osLine;
+	}
+
+	private String detectOperatingSystem() {
+		String osName = System.getProperty("os.name", "unknown");
+		String osVersion = System.getProperty("os.version", "unknown");
+		String osArch = System.getProperty("os.arch", "unknown");
+		return osName + " " + osVersion + " (" + osArch + ")";
 	}
 
 	public void runCommand(String line) {
@@ -162,6 +181,8 @@ public class ElowbeAgent extends JinCanvas {
 		if (line.startsWith("/")) {
 			runSlashCommand(line.substring(1).trim());
 		} else if (!runTerminalCommand(line)) {
+			printWidget.setColor(Colors.blue);
+
 			sendAgentInstruction(line);
 		}
 	}
@@ -412,6 +433,8 @@ public class ElowbeAgent extends JinCanvas {
 		case "clear" -> {
 			chatHistory.clear();
 			printWidget.clear();
+			agentTokenCount = 0;
+			totalAgentTokenCount = 0;
 		}
 		case "model" -> openModelPicker();
 		case "system" -> handleSystemCommand(cmd);
@@ -626,14 +649,14 @@ public class ElowbeAgent extends JinCanvas {
 
 	public void keyDown(KeyEvent e) {
 		updateHeldKeys(e, true);
-		if (controlHeld && spaceHeld) {
+		if (isControlDown(e) ) {
 			if (e.getKeyCode() == KeyEvent.VK_UP) {
-				printWidget.scroll(-1);
+				printWidget.scroll(e.isShiftDown() ? -5 : -1);
 				e.consume();
 				return;
 			}
 			if (e.getKeyCode() == KeyEvent.VK_DOWN) {
-				printWidget.scroll(1);
+				printWidget.scroll(e.isShiftDown() ? 5 : 1);
 				e.consume();
 				return;
 			}
@@ -647,7 +670,9 @@ public class ElowbeAgent extends JinCanvas {
 		updateHeldKeys(e, false);
 
 	}
-
+	public boolean isControlDown(KeyEvent e) {
+		return Settings.isMac() ? e.isMetaDown() : e.isControlDown();
+	}
 	private void updateHeldKeys(KeyEvent e, boolean pressed) {
 		if (e.getKeyCode() == KeyEvent.VK_CONTROL) {
 			controlHeld = pressed;

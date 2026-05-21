@@ -29,7 +29,7 @@ done: Terminate the agent when the task is complete
 Tool argument shapes:
 
 read: {"path":"relative/or/absolute/file"}
-bash: {"command":"shell command"}
+bash: {"command":"shell command","timeout_seconds":120}
 edit: {"path":"file","old":"exact text to replace","new":"replacement text"}
 write: {"path":"file","content":"new file contents"}
 subtask: {"task":"small self-contained goal","context":"brief relevant context"}

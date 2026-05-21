@@ -7,7 +7,9 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.time.Duration;
+import java.util.Locale;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
@@ -19,9 +21,13 @@ import com.elowbe.agent.AgentRunner;
 
 public class AgentTools {
 	private static final int MAX_OUTPUT_CHARS = 40_000;
-	private static final Duration BASH_TIMEOUT = Duration.ofSeconds(60);
+	private static final int RUN_HEAD_CHARS = 18_000;
+	private static final int RUN_TAIL_CHARS = 18_000;
+	private static final Duration DEFAULT_BASH_TIMEOUT = Duration.ofSeconds(60);
 	private static final BooleanSupplier NEVER_CANCEL = () -> false;
 	private static final Set<ManagedProcess> ACTIVE_PROCESSES = ConcurrentHashMap.newKeySet();
+	private static final Path DEBUG_LOG_PATH = Path
+			.of("/Users/kingroka/eclipse-workspace/ElowbeAgent/src/.cursor/debug-b8f46f.log");
 	private static final String BASH_WRAPPER = """
 			emulate -L zsh
 			setopt no_monitor 2>/dev/null || true
@@ -83,6 +89,7 @@ public class AgentTools {
 			return switch (name) {
 			case "read" -> read(arguments, workingDirectory);
 			case "bash" -> bash(arguments, workingDirectory, cancelRequested);
+			case "run" -> run(arguments, workingDirectory, cancelRequested);
 			case "edit" -> edit(arguments, workingDirectory);
 			case "write" -> write(arguments, workingDirectory);
 			case "subtask" -> subtask(arguments, workingDirectory, cancelRequested, subtaskDepth);
@@ -118,6 +125,12 @@ public class AgentTools {
 		if (command.isBlank()) {
 			return ToolResult.output("bash: missing command");
 		}
+		// #region agent log
+		appendDebugLog("pre-fix", "H3", "AgentTools.java:bash:command", "About to execute managed bash command",
+				new JSONObject().put("command", command)
+						.put("workingDirectory", workingDirectory == null ? "(null)" : workingDirectory.getPath()));
+		// #endregion
+		Duration timeout = resolveBashTimeout(arguments);
 		if (cancelRequested.getAsBoolean()) {
 			return ToolResult.output("bash: cancelled");
 		}
@@ -146,7 +159,7 @@ public class AgentTools {
 		boolean completed = false;
 		boolean timedOut = false;
 		boolean cancelled = false;
-		long deadline = System.nanoTime() + BASH_TIMEOUT.toNanos();
+		long deadline = System.nanoTime() + timeout.toNanos();
 		try {
 			while (true) {
 				managedProcess.rememberDescendants();
@@ -178,25 +191,64 @@ public class AgentTools {
 		if (cancelled) {
 			result.append("Cancelled\n");
 		} else if (timedOut) {
-			result.append("Timed out after ").append(BASH_TIMEOUT.toSeconds())
+			result.append("Timed out after ").append(timeout.toSeconds())
 					.append(" seconds while the process was still alive\n");
 		}
-		result.append("exit_code: ");
-		if (completed) {
-			result.append(process.exitValue());
-		} else if (cancelled) {
-			result.append("cancelled");
-		} else {
-			result.append("timeout");
-		}
-		result.append('\n');
 		if (!stdout.text().isBlank()) {
 			result.append("stdout:\n").append(stdout.text()).append('\n');
 		}
 		if (!stderr.text().isBlank()) {
 			result.append("stderr:\n").append(stderr.text()).append('\n');
 		}
+		// #region agent log
+		appendDebugLog("pre-fix", "H1", "AgentTools.java:bash:result", "Managed bash command completed",
+				new JSONObject()
+						.put("command", command)
+						.put("completed", completed)
+						.put("timedOut", timedOut)
+						.put("cancelled", cancelled)
+						.put("stdout", truncate(stdout.text()))
+						.put("stderr", truncate(stderr.text()))
+						.put("hasReadOnlyStatusError", stderr.text().contains("read-only variable:status")));
+		// #endregion
 		return ToolResult.output(truncate(result.toString().trim()));
+	}
+
+	private static Duration resolveBashTimeout(JSONObject arguments) {
+		if (arguments == null || !arguments.has("timeout_seconds") || arguments.isNull("timeout_seconds")) {
+			return DEFAULT_BASH_TIMEOUT;
+		}
+		Object raw = arguments.get("timeout_seconds");
+		double seconds;
+		if (raw instanceof Number number) {
+			seconds = number.doubleValue();
+		} else {
+			try {
+				seconds = Double.parseDouble(String.valueOf(raw).trim());
+			} catch (NumberFormatException e) {
+				return DEFAULT_BASH_TIMEOUT;
+			}
+		}
+		if (!Double.isFinite(seconds) || seconds <= 0) {
+			return DEFAULT_BASH_TIMEOUT;
+		}
+		long millis = Math.max(1L, Math.round(seconds * 1000.0));
+		return Duration.ofMillis(millis);
+	}
+
+	private static ToolResult run(JSONObject arguments, File workingDirectory, BooleanSupplier cancelRequested)
+			throws IOException, InterruptedException {
+		String command = first(arguments, "command", "cmd");
+		if (command.isBlank()) {
+			String os = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
+			command = os.contains("win") ? "cmd /c run.bat" : "bash ./run.sh";
+		}
+		ToolResult raw = bash(new JSONObject().put("command", command), workingDirectory, cancelRequested);
+		String output = raw.getOutput();
+		StringBuilder visible = new StringBuilder();
+		visible.append("run_command: ").append(command).append('\n');
+		visible.append(formatRunOutput(output));
+		return ToolResult.output(visible.toString());
 	}
 
 	private static ToolResult subtask(JSONObject arguments, File workingDirectory, BooleanSupplier cancelRequested,
@@ -287,10 +339,56 @@ public class AgentTools {
 	}
 
 	private static String truncate(String text) {
+		if (text == null) {
+			return "";
+		}
 		if (text.length() <= MAX_OUTPUT_CHARS) {
 			return text;
 		}
-		return text.substring(0, MAX_OUTPUT_CHARS) + "\n... truncated ...";
+		int keepHead = Math.max(1, MAX_OUTPUT_CHARS / 2 - 100);
+		int keepTail = Math.max(1, MAX_OUTPUT_CHARS - keepHead - 150);
+		int omitted = text.length() - keepHead - keepTail;
+		return text.substring(0, keepHead)
+				+ "\n... truncated " + omitted + " chars ...\n"
+				+ text.substring(text.length() - keepTail);
+	}
+
+	private static String formatRunOutput(String rawOutput) {
+		if (rawOutput == null || rawOutput.isBlank()) {
+			return "run_output: (empty)";
+		}
+		if (rawOutput.length() <= MAX_OUTPUT_CHARS) {
+			return "run_output:\n" + rawOutput;
+		}
+		int head = Math.min(RUN_HEAD_CHARS, rawOutput.length());
+		int tail = Math.min(RUN_TAIL_CHARS, rawOutput.length() - head);
+		int omitted = Math.max(0, rawOutput.length() - head - tail);
+		StringBuilder output = new StringBuilder();
+		output.append("run_output_head:\n");
+		output.append(rawOutput, 0, head);
+		output.append("\n... run output truncated, omitted ").append(omitted).append(" chars ...\n");
+		if (tail > 0) {
+			output.append("run_output_tail:\n");
+			output.append(rawOutput.substring(rawOutput.length() - tail));
+		}
+		return output.toString();
+	}
+
+	private static void appendDebugLog(String runId, String hypothesisId, String location, String message,
+			JSONObject data) {
+		try {
+			JSONObject payload = new JSONObject()
+					.put("sessionId", "b8f46f")
+					.put("runId", runId)
+					.put("hypothesisId", hypothesisId)
+					.put("location", location)
+					.put("message", message)
+					.put("data", data == null ? new JSONObject() : data)
+					.put("timestamp", System.currentTimeMillis());
+			Files.writeString(DEBUG_LOG_PATH, payload.toString() + "\n", StandardCharsets.UTF_8,
+					StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+		} catch (Exception ignored) {
+		}
 	}
 
 	private static void destroyProcessTree(Process process) {

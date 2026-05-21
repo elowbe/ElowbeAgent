@@ -3,6 +3,10 @@ package com.elowbe.agent;
 import java.io.File;
 import java.io.IOException;
 import java.io.InterruptedIOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Locale;
 import java.util.function.BooleanSupplier;
 
 import org.json.JSONArray;
@@ -20,6 +24,45 @@ public class AgentRunner {
 	private static final int MAX_SUBTASK_DEPTH = 1;
 	private static final int MAX_SUBTASK_RESULT_CHARS = 40_000;
 	private static final BooleanSupplier NEVER_CANCEL = () -> false;
+	private static final String RUN_SCRIPT_UNIX = """
+			#!/usr/bin/env bash
+			set -euo pipefail
+
+			if [ -f "pom.xml" ]; then
+			  mvn -q -DskipTests compile exec:java
+			elif [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
+			  ./gradlew run
+			elif [ -f "package.json" ]; then
+			  npm run start
+			else
+			  echo "No supported run target found (pom.xml, gradle build, or package.json)."
+			  exit 1
+			fi
+			""";
+	private static final String RUN_SCRIPT_WINDOWS = """
+			@echo off
+			setlocal
+
+			if exist pom.xml (
+			  call mvn -q -DskipTests compile exec:java
+			  goto :eof
+			)
+			if exist build.gradle (
+			  call gradlew.bat run
+			  goto :eof
+			)
+			if exist build.gradle.kts (
+			  call gradlew.bat run
+			  goto :eof
+			)
+			if exist package.json (
+			  call npm run start
+			  goto :eof
+			)
+
+			echo No supported run target found (pom.xml, gradle build, or package.json).
+			exit /b 1
+			""";
 	private static final String SUBTASK_SYSTEM_PROMPT = """
 			You are a focused worker agent for a larger coding task.
 			Complete only the assigned subtask using the available tools.
@@ -32,7 +75,8 @@ public class AgentRunner {
 
 			Available tools:
 			read: {"path":"relative/or/absolute/file"}
-			bash: {"command":"shell command"}
+			bash: {"command":"shell command","timeout_seconds":120}
+			run: {"command":"optional override; defaults to run.sh/run.bat for this OS"}
 			edit: {"path":"file","old":"exact text to replace","new":"replacement text"}
 			write: {"path":"file","content":"new file contents"}
 			done: {"response":"final result for the master agent"}
@@ -42,6 +86,13 @@ public class AgentRunner {
 			run an inspection command, edit files, write files, or run a verification command.
 			If you cannot use a tool, call done with a clear explanation that no tool evidence
 			was produced.
+
+			HARD RULE:
+			Before calling done, run the project via the generated run script in the current directory:
+			- preferred: run tool with no arguments
+			- fallback: macOS/Linux ./run.sh (or bash run.sh), Windows cmd /c run.bat
+			Then include a run output analysis in your final response with:
+			- key stdout/stderr findings
 			""";
 
 	@FunctionalInterface
@@ -124,7 +175,11 @@ public class AgentRunner {
 		if (cancelRequested == null) {
 			cancelRequested = NEVER_CANCEL;
 		}
+		if (subtaskDepth == 0) {
+			ensureRunScripts(workingDirectory);
+		}
 		JSONObject format = ToolChoiceSchema.build(subtaskDepth < MAX_SUBTASK_DEPTH);
+		CompletionGuard guard = new CompletionGuard();
 
 		for (int turn = 0; turn < MAX_TURNS; turn++) {
 			throwIfCancelled(cancelRequested);
@@ -179,6 +234,7 @@ public class AgentRunner {
 						toolSink.accept(name, arguments, result.getOutput());
 					}
 					appendToolResult(messages, name, arguments, result.getOutput());
+					guard.observe(name, arguments, result.getOutput());
 
 					if (result.isComplete()) {
 						completedByTool = true;
@@ -187,6 +243,13 @@ public class AgentRunner {
 				}
 				if (completedByTool) {
 					String response = toolFinalResponse.isBlank() ? step.optString("response", "") : toolFinalResponse;
+					if (subtaskDepth == 0) {
+						String validationError = guard.validateFinalResponse(response);
+						if (validationError != null) {
+							appendUserInstruction(messages, validationError);
+							continue;
+						}
+					}
 					if (!response.isBlank() && tokenSink != null) {
 						tokenSink.accept(response);
 					}
@@ -197,6 +260,13 @@ public class AgentRunner {
 
 			if (step.optBoolean("complete", false) || "final".equals(step.optString("step"))) {
 				String response = step.optString("response", "");
+				if (subtaskDepth == 0) {
+					String validationError = guard.validateFinalResponse(response);
+					if (validationError != null) {
+						appendUserInstruction(messages, validationError);
+						continue;
+					}
+				}
 				if (!response.isBlank() && tokenSink != null) {
 					tokenSink.accept(response);
 				}
@@ -442,6 +512,75 @@ public class AgentRunner {
 	private static void throwIfCancelled(BooleanSupplier cancelRequested) throws InterruptedIOException {
 		if (cancelRequested.getAsBoolean()) {
 			throw new InterruptedIOException("Agent cancelled");
+		}
+	}
+
+	private static void ensureRunScripts(File workingDirectory) {
+		if (workingDirectory == null) {
+			return;
+		}
+		try {
+			if (!workingDirectory.exists()) {
+				workingDirectory.mkdirs();
+			}
+			Path runSh = new File(workingDirectory, "run.sh").toPath();
+			Path runBat = new File(workingDirectory, "run.bat").toPath();
+			if (!Files.exists(runSh)) {
+				Files.writeString(runSh, RUN_SCRIPT_UNIX, StandardCharsets.UTF_8);
+			}
+			if (!Files.exists(runBat)) {
+				Files.writeString(runBat, RUN_SCRIPT_WINDOWS, StandardCharsets.UTF_8);
+			}
+			runSh.toFile().setExecutable(true, false);
+		} catch (IOException ignored) {
+			// Non-fatal: completion guard still requires script execution evidence.
+		}
+	}
+
+	private static class CompletionGuard {
+		private boolean runScriptExecuted;
+		private String lastRunOutput = "";
+
+		private void observe(String name, JSONObject arguments, String output) {
+			if ("run".equals(name)) {
+				runScriptExecuted = true;
+				lastRunOutput = output == null ? "" : output;
+				return;
+			}
+			if (!"bash".equals(name)) {
+				return;
+			}
+			String command = first(arguments, "command", "cmd").toLowerCase(Locale.ROOT);
+			boolean ranUnixScript = command.contains("./run.sh") || command.contains("bash run.sh");
+			boolean ranWindowsScript = command.contains("run.bat")
+					|| command.contains("cmd /c run.bat")
+					|| command.contains("cmd.exe /c run.bat");
+			if (ranUnixScript || ranWindowsScript) {
+				runScriptExecuted = true;
+				lastRunOutput = output == null ? "" : output;
+			}
+		}
+
+		private String validateFinalResponse(String response) {
+			if (!runScriptExecuted) {
+				return """
+						HARD RULE NOT SATISFIED:
+						Do not finish yet.
+						1) Ensure run.sh and run.bat exist in the current directory.
+						2) Run the program via script using bash:
+						   - preferred: run tool with no arguments
+						   - fallback: macOS/Linux ./run.sh (or bash run.sh), Windows cmd /c run.bat
+						3) Then call done with a final response that includes run output analysis (must mention key stdout/stderr findings).
+						""";
+			}
+			String text = response == null ? "" : response.toLowerCase(Locale.ROOT);
+			boolean hasAnalysisWord = text.contains("analysis");
+			boolean mentionsStdoutOrStderr = text.contains("stdout") || text.contains("stderr");
+			if (!hasAnalysisWord || !mentionsStdoutOrStderr) {
+				return "HARD RULE NOT SATISFIED: you ran the script, but your final response is missing run analysis. "
+						+ "Include a 'Run output analysis' section with key stdout/stderr findings before done.";
+			}
+			return null;
 		}
 	}
 }

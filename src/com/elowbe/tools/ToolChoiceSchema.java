@@ -56,6 +56,7 @@ public class ToolChoiceSchema {
 		JSONArray toolNames = new JSONArray()
 				.put("read")
 				.put("bash")
+				.put("run")
 				.put("edit")
 				.put("write");
 		if (includeSubtask) {
