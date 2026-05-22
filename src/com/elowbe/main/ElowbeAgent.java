@@ -911,11 +911,10 @@ public class ElowbeAgent extends JinCanvas {
 		commandInput.column = 0;
 		commandInput.height = Math.max(3, commandInput.getLines() + 3);
 		if (!agentBusy) {
-			t2d.setColor(Colors.white);
-		} else {
-			t2d.setColor(barColor);
-
+			barColor = Colors.white;
 		}
+		t2d.setColor(barColor);
+
 		t2d.drawBox(0, commandInput.row, JinConsole.getColumns(), commandInput.height - 1);
 
 		
