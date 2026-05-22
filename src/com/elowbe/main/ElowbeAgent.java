@@ -20,6 +20,9 @@ import org.json.JSONObject;
 
 import com.elowbe.agent.AgentRunner;
 import com.elowbe.commands.Command;
+import com.elowbe.git.GitService;
+import com.elowbe.git.GitService.CommitMessage;
+import com.elowbe.git.GitService.FileChange;
 import com.elowbe.tools.AgentTools;
 import com.jinteractive.gui.Settings;
 import com.jinteractive.main.Colors;
@@ -28,6 +31,7 @@ import lib.console.main.JinCanvas;
 import lib.console.main.JinConsole;
 import lib.console.main.JinGraphics;
 import lib.console.util.OllamaAPI;
+import lib.console.widgets.GitDiffReviewWidget;
 import lib.console.widgets.InputWidget;
 import lib.console.widgets.OptionsWidget;
 
@@ -39,7 +43,7 @@ public class ElowbeAgent extends JinCanvas {
 	private static String ollamaUrl = "http://10.0.0.8:11434";
 	InputWidget commandInput;
 	PrintWidget printWidget;
-	File directory = new File("agenttest");
+	File directory;
 	private String systemPrompt = "";
 	/** Primary skill.md supplement loaded for the current working directory. */
 	private Skill primarySkill = Skill.parse("", null);
@@ -64,12 +68,25 @@ public class ElowbeAgent extends JinCanvas {
 	private boolean spaceHeld;
 	/** Photos dropped onto the window, sent with the next agent message. */
 	private final List<File> attachedPhotos = new ArrayList<>();
+	private GitDiffReviewWidget gitReviewWidget;
+	private List<FileChange> pendingReviewChanges = new ArrayList<>();
+	private int reviewIndex;
+	private int acceptedReviewCount;
+	private AgentSettings agentSettings;
+	private OptionsWidget newProjectPickerWidget;
+	private OptionsWidget projectPickerWidget;
+	private File[] listedProjects = new File[0];
+	private String pendingNewProjectName;
+	private boolean awaitingProjectParentPath;
+	private volatile boolean runBusy;
+	private final AtomicBoolean runCancelRequested = new AtomicBoolean();
+	private volatile Thread runThread;
 
 	public static void main(String[] args) {
 		// Makes a window with 1280x720 pixel resolution and a console of 40 columns and
 		// 30 rows.
 		OllamaAPI.BASE_URL = ollamaUrl;
-		Runtime.getRuntime().addShutdownHook(new Thread(AgentTools::cancelActiveProcesses, "elowbe-agent-shutdown"));
+		Runtime.getRuntime().addShutdownHook(new Thread(ElowbeAgent::shutdownAllProcesses, "elowbe-agent-shutdown"));
 		JinConsole.start(new ElowbeAgent(), "Agent", 90, 40, 960, 720);
 	}
 
@@ -89,7 +106,15 @@ public class ElowbeAgent extends JinCanvas {
 		commandInput.takeFocus();
 
 		loadSystemPrompt();
+		agentSettings = AgentSettings.load();
+		try {
+			directory = agentSettings.ensureProjectsDirectory();
+		} catch (IOException e) {
+			directory = AgentSettings.defaultProjectsDirectory();
+			printWidget.println("Could not create projects folder: " + e.getMessage());
+		}
 		loadSkills();
+		ensureGitRepository(false);
 	}
 
 	private static File resolveSystemPromptFile() {
@@ -264,6 +289,10 @@ public class ElowbeAgent extends JinCanvas {
 		printWidget.setColor(Colors.white);
 		commandInput.setValue("");
 
+		if (awaitingProjectParentPath) {
+			handleProjectParentInput(line);
+			return;
+		}
 		if (line.startsWith("/")) {
 			runSlashCommand(line.substring(1).trim());
 			return;
@@ -337,6 +366,7 @@ public class ElowbeAgent extends JinCanvas {
 		}
 		directory = target;
 		loadSkills();
+		ensureGitRepository(false);
 	}
 
 	private void runLs(String path) {
@@ -409,6 +439,15 @@ public class ElowbeAgent extends JinCanvas {
 			return;
 		}
 
+		if (commandLine.equals("run") || commandLine.startsWith("run ")) {
+			handleRunCommand();
+			return;
+		}
+		if (commandLine.equals("new") || commandLine.startsWith("new ")) {
+			handleNewCommand(commandLine.substring(3).trim());
+			return;
+		}
+
 		Command cmd;
 		try {
 			cmd = Command.parse(commandLine);
@@ -455,12 +494,12 @@ public class ElowbeAgent extends JinCanvas {
 //						printWidget.print(token);
 //					}
 					if(t < 0) {
-						targetColor = Colors.randomColorFromSeed("" + Math.random() * 1000000L, .5f, 1f);
+						targetColor = Colors.randomColorFromSeed("" + Math.random() * 1000000L, .95f, 1f);
 						t=0;
 					}
 				}, thinking -> {
 					if(t < 0) {
-						targetColor = Colors.randomColorFromSeed("" + Math.random() * 1000000L, .5f, 1f);
+						targetColor = Colors.randomColorFromSeed("" + Math.random() * 1000000L, .95f, 1f);
 						t=0;
 					}
 					// printWidget.setColor(subtaskActive ? Colors.darkblue : Colors.lightgray);
@@ -473,6 +512,10 @@ public class ElowbeAgent extends JinCanvas {
 						chatHistory.put(request.get(i));
 					}
 					printWidget.println();
+					ensureGitRepository(false);
+					printWidget.setColor(Colors.lightblue);
+					printWidget.println("Task complete. Run /review to inspect changes and commit.");
+					printWidget.setColor(Colors.white);
 				}
 			} catch (IOException e) {
 				if (agentCancelRequested.get() || Thread.currentThread().isInterrupted()) {
@@ -572,12 +615,65 @@ public class ElowbeAgent extends JinCanvas {
 		}
 		printWidget.println();
 		printWidget.println("Cancelling agent...");
+		shutdownAgentProcesses();
+		return true;
+	}
+
+	private boolean cancelRun() {
+		if (!runBusy) {
+			return false;
+		}
+		if (!runCancelRequested.compareAndSet(false, true)) {
+			return true;
+		}
+		printWidget.println();
+		printWidget.println("Cancelling run...");
+		shutdownRunProcesses();
+		return true;
+	}
+
+	private boolean cancelActiveWork() {
+		if (runBusy && cancelRun()) {
+			return true;
+		}
+		return cancelAgent();
+	}
+
+	private void shutdownRunProcesses() {
+		runCancelRequested.set(true);
+		ProjectRunner.cancel();
+		Thread thread = runThread;
+		if (thread != null) {
+			thread.interrupt();
+		}
+	}
+
+	private void shutdownAgentProcesses() {
+		agentCancelRequested.set(true);
 		AgentTools.cancelActiveProcesses();
 		Thread thread = agentThread;
 		if (thread != null) {
 			thread.interrupt();
 		}
-		return true;
+	}
+
+	private static void shutdownAllProcesses() {
+		ProjectRunner.cancel();
+		AgentTools.cancelActiveProcesses();
+	}
+
+	private void shutdownAllProcessesFromInstance() {
+		runCancelRequested.set(true);
+		agentCancelRequested.set(true);
+		shutdownAllProcesses();
+		Thread run = runThread;
+		if (run != null) {
+			run.interrupt();
+		}
+		Thread agent = agentThread;
+		if (agent != null) {
+			agent.interrupt();
+		}
 	}
 
 	public String getAgentModel() {
@@ -605,6 +701,10 @@ public class ElowbeAgent extends JinCanvas {
 		case "model" -> openModelPicker();
 		case "system" -> handleSystemCommand(cmd);
 		case "skill" -> handleSkillCommand(cmd);
+		case "review" -> startGitReview();
+		case "run" -> handleRunCommand();
+		case "new" -> printNewHelp();
+		case "open" -> openProjectPicker();
 		default -> printWidget.println("Unknown command: " + cmd.getName());
 		}
 	}
@@ -774,6 +874,527 @@ public class ElowbeAgent extends JinCanvas {
 		printWidget.println("  /system -set \"...\"         set and save prompt");
 	}
 
+	private void ensureGitRepository(boolean verbose) {
+		try {
+			if (GitService.isRepository(directory)) {
+				return;
+			}
+			GitService.ensureRepository(directory);
+			if (verbose) {
+				printWidget.println("Initialized git repository in " + directory.getPath());
+			}
+		} catch (Exception e) {
+			printWidget.println("Git init failed: " + e.getMessage());
+		}
+	}
+
+	private void startGitReview() {
+		if (agentBusy) {
+			printWidget.println("Agent is still responding. Please wait.");
+			return;
+		}
+		if (gitReviewWidget != null && !gitReviewWidget.isDestroyed()) {
+			gitReviewWidget.takeFocus();
+			return;
+		}
+
+		printWidget.println("Loading git changes...");
+
+		new Thread(() -> {
+			try {
+				ensureGitRepository(true);
+				List<FileChange> changes = GitService.listChanges(directory);
+				showGitReview(changes);
+			} catch (Exception e) {
+				printWidget.println("Git review failed: " + e.getMessage());
+			}
+		}, "elowbe-git-review-load").start();
+	}
+
+	private void showGitReview(List<FileChange> changes) {
+		if (changes.isEmpty()) {
+			printWidget.println("No changes to review.");
+			return;
+		}
+
+		pendingReviewChanges = new ArrayList<>(changes);
+		reviewIndex = 0;
+		acceptedReviewCount = 0;
+
+		int panelWidth = JinConsole.getColumns() - 4;
+		int panelHeight = JinConsole.getRows() - 6;
+		int column = (JinConsole.getColumns() - panelWidth) / 2;
+		int row = (JinConsole.getRows() - panelHeight) / 2;
+
+		GitDiffReviewWidget widget = new GitDiffReviewWidget(column, row, panelWidth, panelHeight);
+		widget.listener = new GitDiffReviewWidget.Listener() {
+			@Override
+			public void onAccept() {
+				applyReviewDecision(true, false);
+			}
+
+			@Override
+			public void onReject() {
+				applyReviewDecision(false, false);
+			}
+
+			@Override
+			public void onAcceptAll() {
+				applyReviewDecision(true, true);
+			}
+
+			@Override
+			public void onCancel() {
+				cancelGitReview("Review cancelled.");
+			}
+		};
+		widget.onCancel = () -> cancelGitReview("Review cancelled.");
+
+		gitReviewWidget = widget;
+		addWidget(widget);
+		showCurrentReviewChange();
+		widget.takeFocus();
+	}
+
+	private void showCurrentReviewChange() {
+		if (gitReviewWidget == null || pendingReviewChanges.isEmpty()) {
+			return;
+		}
+		if (reviewIndex >= pendingReviewChanges.size()) {
+			finishGitReview();
+			return;
+		}
+		FileChange change = pendingReviewChanges.get(reviewIndex);
+		gitReviewWidget.setChange(reviewIndex, pendingReviewChanges.size(), change.path, change.diff);
+	}
+
+	private void applyReviewDecision(boolean accepted, boolean acceptRemaining) {
+		if (gitReviewWidget == null || reviewIndex >= pendingReviewChanges.size()) {
+			return;
+		}
+
+		try {
+			if (acceptRemaining) {
+				while (reviewIndex < pendingReviewChanges.size()) {
+					FileChange change = pendingReviewChanges.get(reviewIndex);
+					GitService.stageFile(directory, change.path);
+					acceptedReviewCount++;
+					reviewIndex++;
+				}
+				finishGitReview();
+				return;
+			}
+
+			FileChange change = pendingReviewChanges.get(reviewIndex);
+			if (accepted) {
+				GitService.stageFile(directory, change.path);
+				acceptedReviewCount++;
+			} else {
+				GitService.rejectFile(directory, change);
+			}
+			reviewIndex++;
+			if (reviewIndex >= pendingReviewChanges.size()) {
+				finishGitReview();
+			} else {
+				showCurrentReviewChange();
+			}
+		} catch (Exception e) {
+			cancelGitReview("Review failed: " + e.getMessage());
+		}
+	}
+
+	private void finishGitReview() {
+		closeGitReviewWidget();
+		if (acceptedReviewCount <= 0) {
+			printWidget.println("No changes accepted. Nothing committed.");
+			return;
+		}
+
+		printWidget.println("Generating commit message for " + acceptedReviewCount + " accepted change(s)...");
+
+		new Thread(() -> {
+			try {
+				String diffSummary = GitService.stagedDiffSummary(directory);
+				String previousModel = OllamaAPI.model;
+				OllamaAPI.model = agentModel;
+				CommitMessage message;
+				try {
+					message = GitService.generateCommitMessage(diffSummary);
+				} finally {
+					OllamaAPI.model = previousModel;
+				}
+				GitService.commit(directory, message);
+				printWidget.setColor(Colors.green);
+				printWidget.println("Committed: " + message.subject);
+				if (!message.body.isBlank()) {
+					printWidget.println(message.body);
+				}
+				printWidget.setColor(Colors.white);
+			} catch (Exception e) {
+				printWidget.println("Commit failed: " + e.getMessage());
+			}
+		}, "elowbe-git-commit").start();
+	}
+
+	private void cancelGitReview(String message) {
+		closeGitReviewWidget();
+		pendingReviewChanges.clear();
+		reviewIndex = 0;
+		acceptedReviewCount = 0;
+		if (message != null && !message.isBlank()) {
+			printWidget.println(message);
+		}
+	}
+
+	private void closeGitReviewWidget() {
+		if (gitReviewWidget == null) {
+			return;
+		}
+		gitReviewWidget.blur();
+		removeWidget(gitReviewWidget);
+		gitReviewWidget = null;
+		commandInput.takeFocus();
+	}
+
+	private void handleRunCommand() {
+		if (agentBusy) {
+			printWidget.println("Agent is still responding. Please wait.");
+			return;
+		}
+		if (runBusy) {
+			printWidget.println("A run is already in progress.");
+			return;
+		}
+
+		boolean windows = System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("win");
+		String scriptName = windows ? "run.bat" : "run.sh";
+		File script = new File(directory, scriptName);
+		if (!script.isFile()) {
+			printWidget.println("No " + scriptName + " found in " + directory.getPath());
+			return;
+		}
+
+		runBusy = true;
+		runCancelRequested.set(false);
+		printWidget.setColor(Colors.yellow);
+		printWidget.println("Running " + scriptName + " in " + directory.getPath() + "...");
+		printWidget.setColor(Colors.white);
+
+		Thread thread = new Thread(() -> {
+			try {
+				ProjectRunner.run(directory, line -> {
+					printWidget.setColor(Colors.lightgray);
+					printWidget.println(line);
+					printWidget.setColor(Colors.white);
+				}, () -> runCancelRequested.get() || Thread.currentThread().isInterrupted());
+				if (!runCancelRequested.get()) {
+					printWidget.setColor(Colors.green);
+					printWidget.println(scriptName + " finished successfully.");
+					printWidget.setColor(Colors.white);
+				}
+			} catch (ProjectRunner.RunCancelledException e) {
+				printWidget.println("Run cancelled.");
+			} catch (Exception e) {
+				if (runCancelRequested.get() || Thread.currentThread().isInterrupted()) {
+					printWidget.println("Run cancelled.");
+				} else {
+					printWidget.println("Run failed: " + e.getMessage());
+				}
+			} finally {
+				runBusy = false;
+				runCancelRequested.set(false);
+				if (runThread == Thread.currentThread()) {
+					runThread = null;
+				}
+			}
+		}, "elowbe-project-run");
+		runThread = thread;
+		thread.start();
+	}
+
+	private void handleNewCommand(String args) {
+		if (args.isEmpty()) {
+			printNewHelp();
+			return;
+		}
+		if (args.startsWith("-")) {
+			try {
+				handleNewCommandFlags(Command.parse("new " + args));
+			} catch (IllegalArgumentException e) {
+				printWidget.println("Error: " + e.getMessage());
+			}
+			return;
+		}
+		openNewProjectPicker(stripQuotes(args));
+	}
+
+	private void handleNewCommandFlags(Command cmd) {
+		String name = cmd.get("name");
+		if (name == null || name.isBlank()) {
+			printNewHelp();
+			return;
+		}
+		name = sanitizeProjectName(stripQuotes(name.trim()));
+		if (name == null) {
+			return;
+		}
+
+		String dir = cmd.get("dir");
+		if (dir != null && !dir.isBlank()) {
+			try {
+				File parent = resolveUserPath(stripQuotes(dir.trim()));
+				if (!parent.exists() && !parent.mkdirs()) {
+					printWidget.println("Could not create parent directory: " + parent.getPath());
+					return;
+				}
+				agentSettings.setProjectsDirectory(parent);
+				createNewProject(parent, name);
+			} catch (IOException e) {
+				printWidget.println("New project failed: " + e.getMessage());
+			}
+			return;
+		}
+
+		openNewProjectPicker(name);
+	}
+
+	private void openNewProjectPicker(String projectName) {
+		if (newProjectPickerWidget != null && !newProjectPickerWidget.isDestroyed()) {
+			newProjectPickerWidget.takeFocus();
+			return;
+		}
+
+		try {
+			File projectsDir = agentSettings.ensureProjectsDirectory();
+			File target = new File(projectsDir, projectName);
+			String defaultOption = "Use " + truncatePath(target.getAbsolutePath());
+			String[] options = { defaultOption, "Choose a different parent folder..." };
+
+			int panelWidth = Math.min(JinConsole.getColumns() - 4, Math.max(defaultOption.length() + 6, 48));
+			int panelHeight = 8;
+			int column = (JinConsole.getColumns() - panelWidth) / 2;
+			int row = (JinConsole.getRows() - panelHeight) / 2;
+
+			OptionsWidget optionsWidget = new OptionsWidget(column, row, options);
+			optionsWidget.panelWidth = panelWidth;
+			optionsWidget.panelHeight = panelHeight;
+			optionsWidget.title = "New Project: " + projectName;
+			optionsWidget.elevation = 100;
+			optionsWidget.color = Colors.white;
+			optionsWidget.setCallback((index, label) -> {
+				closeNewProjectPicker();
+				if (index == 0) {
+					createNewProject(projectsDir, projectName);
+				} else {
+					pendingNewProjectName = projectName;
+					awaitingProjectParentPath = true;
+					printWidget.println("Enter parent directory path for new project:");
+					commandInput.takeFocus();
+				}
+			});
+			optionsWidget.onCancel = () -> {
+				printWidget.println("New project cancelled.");
+				closeNewProjectPicker();
+			};
+
+			newProjectPickerWidget = optionsWidget;
+			addWidget(optionsWidget);
+			optionsWidget.takeFocus();
+		} catch (IOException e) {
+			printWidget.println("New project failed: " + e.getMessage());
+		}
+	}
+
+	private void handleProjectParentInput(String pathLine) {
+		awaitingProjectParentPath = false;
+		String projectName = pendingNewProjectName;
+		pendingNewProjectName = null;
+		if (projectName == null || projectName.isBlank()) {
+			printWidget.println("New project cancelled.");
+			return;
+		}
+
+		try {
+			File parent = resolveUserPath(pathLine);
+			if (!parent.exists() && !parent.mkdirs()) {
+				printWidget.println("Could not create parent directory: " + parent.getPath());
+				return;
+			}
+			agentSettings.setProjectsDirectory(parent);
+			createNewProject(parent, projectName);
+		} catch (IOException e) {
+			printWidget.println("New project failed: " + e.getMessage());
+		}
+	}
+
+	private void createNewProject(File parentDirectory, String projectName) {
+		projectName = sanitizeProjectName(projectName);
+		if (projectName == null) {
+			return;
+		}
+
+		File projectDir = new File(parentDirectory, projectName);
+		if (projectDir.exists()) {
+			printWidget.println("Project already exists: " + projectDir.getPath());
+			return;
+		}
+		if (!projectDir.mkdirs()) {
+			printWidget.println("Could not create project directory: " + projectDir.getPath());
+			return;
+		}
+
+		directory = projectDir;
+		loadSkills();
+		ensureGitRepository(true);
+		printWidget.setColor(Colors.green);
+		printWidget.println("Created project: " + projectDir.getPath());
+		printWidget.println("Projects folder default: " + agentSettings.getProjectsDirectory().getPath());
+		printWidget.setColor(Colors.white);
+	}
+
+	private void switchToProject(File projectDir) {
+		directory = projectDir;
+		loadSkills();
+		ensureGitRepository(false);
+	}
+
+	private void openProjectPicker() {
+		if (agentBusy) {
+			printWidget.println("Agent is still responding. Please wait.");
+			return;
+		}
+		if (projectPickerWidget != null && !projectPickerWidget.isDestroyed()) {
+			projectPickerWidget.takeFocus();
+			return;
+		}
+
+		try {
+			File projectsDir = agentSettings.ensureProjectsDirectory();
+			File[] children = projectsDir.listFiles(File::isDirectory);
+			if (children == null || children.length == 0) {
+				printWidget.println("No projects found in " + projectsDir.getPath());
+				printWidget.println("Use /new project-name to create one.");
+				return;
+			}
+
+			java.util.Arrays.sort(children, (a, b) -> a.getName().compareToIgnoreCase(b.getName()));
+			listedProjects = children;
+			String[] labels = new String[children.length];
+			String currentPath = directory.getAbsolutePath();
+			int selectedIndex = 0;
+			for (int i = 0; i < children.length; i++) {
+				labels[i] = children[i].getName();
+				if (children[i].getAbsolutePath().equals(currentPath)) {
+					labels[i] += " (current)";
+					selectedIndex = i;
+				}
+			}
+
+			int panelWidth = JinConsole.getColumns() - 4;
+			int panelHeight = JinConsole.getRows() - 6;
+			int column = (JinConsole.getColumns() - panelWidth) / 2;
+			int row = (JinConsole.getRows() - panelHeight) / 2;
+
+			OptionsWidget options = new OptionsWidget(column, row, labels);
+			options.panelWidth = panelWidth;
+			options.panelHeight = panelHeight;
+			options.title = "Open Project";
+			options.elevation = 100;
+			options.color = Colors.white;
+			options.setSelectedIndex(selectedIndex);
+			options.setCallback((index, label) -> {
+				if (index < 0 || index >= listedProjects.length) {
+					closeProjectPicker();
+					return;
+				}
+				File project = listedProjects[index];
+				switchToProject(project);
+				printWidget.setColor(Colors.green);
+				printWidget.println("Switched to project: " + project.getPath());
+				printWidget.setColor(Colors.white);
+				closeProjectPicker();
+			});
+			options.onCancel = () -> {
+				printWidget.println("Project selection cancelled.");
+				closeProjectPicker();
+			};
+
+			projectPickerWidget = options;
+			addWidget(options);
+			options.takeFocus();
+		} catch (IOException e) {
+			printWidget.println("Failed to list projects: " + e.getMessage());
+		}
+	}
+
+	private void closeProjectPicker() {
+		if (projectPickerWidget == null) {
+			return;
+		}
+		projectPickerWidget.blur();
+		removeWidget(projectPickerWidget);
+		projectPickerWidget = null;
+		listedProjects = new File[0];
+		commandInput.takeFocus();
+	}
+
+	private String sanitizeProjectName(String name) {
+		if (name == null || name.isBlank()) {
+			printWidget.println("Error: project name is required");
+			return null;
+		}
+		name = name.trim();
+		if (name.contains("/") || name.contains("\\") || name.contains("..") || name.equals(".") || name.equals("..")) {
+			printWidget.println("Error: invalid project name");
+			return null;
+		}
+		return name;
+	}
+
+	private File resolveUserPath(String path) throws IOException {
+		if (path == null || path.isBlank()) {
+			throw new IOException("Path is required");
+		}
+		path = stripQuotes(path.trim());
+		if (path.equals("~")) {
+			path = System.getProperty("user.home");
+		} else if (path.startsWith("~/")) {
+			path = System.getProperty("user.home") + path.substring(1);
+		}
+
+		File target = new File(path);
+		if (!target.isAbsolute()) {
+			target = new File(System.getProperty("user.dir"), path);
+		}
+		try {
+			return target.getCanonicalFile();
+		} catch (IOException e) {
+			return target.getAbsoluteFile();
+		}
+	}
+
+	private void printNewHelp() {
+		try {
+			File projectsDir = agentSettings.ensureProjectsDirectory();
+			printWidget.println("Projects folder: " + projectsDir.getPath());
+		} catch (IOException e) {
+			printWidget.println("Projects folder: " + agentSettings.getProjectsDirectory().getPath());
+		}
+		printWidget.println("  /new project-name                 create project in default folder");
+		printWidget.println("  /new -name project-name           same as above");
+		printWidget.println("  /new -dir /parent -name project   create elsewhere and remember parent");
+	}
+
+	private void closeNewProjectPicker() {
+		if (newProjectPickerWidget == null) {
+			return;
+		}
+		newProjectPickerWidget.blur();
+		removeWidget(newProjectPickerWidget);
+		newProjectPickerWidget = null;
+		commandInput.takeFocus();
+	}
+
 	private void closeModelPicker() {
 		if (modelPickerWidget == null) {
 			return;
@@ -791,7 +1412,11 @@ public class ElowbeAgent extends JinCanvas {
 			printWidget.println("/model             choose Ollama model");
 			printWidget.println("/system            system prompt (" + SYSTEM_PROMPT_FILE.getPath() + ")");
 			printWidget.println("/skill             skill.md supplement and .cursor/skills/");
-			printWidget.println("Ctrl+Shift+C      cancel the running agent and its process");
+			printWidget.println("/review            review agent changes and commit");
+			printWidget.println("/run               run run.sh or run.bat in current directory");
+			printWidget.println("/new               create a project in the projects folder");
+			printWidget.println("/open              switch project from the projects folder");
+			printWidget.println("Ctrl+Shift+C      cancel the running agent or /run process");
 			printWidget.println("Drag and drop      attach photos to the next agent message");
 			printWidget.println("cd [path]          change directory (~ for home)");
 			printWidget.println("ls [path]          list directory contents");
@@ -805,6 +1430,10 @@ public class ElowbeAgent extends JinCanvas {
 		printWidget.println("  /model");
 		printWidget.println("  /system -show");
 		printWidget.println("  /skill -list");
+		printWidget.println("  /review");
+		printWidget.println("  /run");
+		printWidget.println("  /new project-name");
+		printWidget.println("  /open");
 	}
 
 	@Override
@@ -945,8 +1574,7 @@ public class ElowbeAgent extends JinCanvas {
 	}
 
 	public void destroy() {
-		cancelAgent();
-		AgentTools.cancelActiveProcesses();
+		shutdownAllProcessesFromInstance();
 	}
 
 	public void scroll(int amount) {
@@ -967,7 +1595,7 @@ public class ElowbeAgent extends JinCanvas {
 				return;
 			}
 		}
-		if (e.getKeyCode() == KeyEvent.VK_C && e.isControlDown() && e.isShiftDown() && cancelAgent()) {
+		if (e.getKeyCode() == KeyEvent.VK_C && e.isControlDown() && e.isShiftDown() && cancelActiveWork()) {
 			e.consume();
 		}
 	}
