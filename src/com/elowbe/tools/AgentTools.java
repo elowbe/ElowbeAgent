@@ -198,8 +198,10 @@ public class AgentTools {
 		if (!stdout.text().isBlank()) {
 			result.append("stdout:\n").append(stdout.text()).append('\n');
 		}
-		if (!stderr.text().isBlank()) {
-			result.append("stderr:\n").append(stderr.text()).append('\n');
+		String stderrText = stderr.text().replace("zsh:28: read-only variable: status", "");
+		
+		if (!stderrText.isBlank()) {
+			result.append("stderr:\n").append(stderrText).append('\n');
 		}
 		// #region agent log
 		appendDebugLog("pre-fix", "H1", "AgentTools.java:bash:result", "Managed bash command completed",

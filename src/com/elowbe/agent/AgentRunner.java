@@ -73,7 +73,7 @@ public class AgentRunner {
 			You must always respond with the JSON object required by the active JSON schema.
 			Do not wrap it in markdown.
 
-			Available tools:
+			Available tools (two-step: pick tool name in tool_call, then fill arguments):
 			read: {"path":"relative/or/absolute/file"}
 			bash: {"command":"shell command","timeout_seconds":120}
 			run: {"command":"optional override; defaults to run.sh/run.bat for this OS"}
@@ -81,9 +81,10 @@ public class AgentRunner {
 			write: {"path":"file","content":"new file contents"}
 			done: {"response":"final result for the master agent"}
 
-			You must call exactly one tool per step. After each tool result returns,
-			decide the next single step and call at most one more tool.
-			Use tool_call for the one tool to run, or null when no tool is needed.
+			You must call exactly one tool per step. When you know the tool, use
+			step=execute_tool with tool_call.name in the same response—do not replan first.
+			After each tool result, the next turn must set tool_call.name (next tool or done).
+			Arguments are collected automatically in a follow-up request with a tool-specific schema.
 			You must call at least one non-done tool before done so the master agent has
 			evidence that this worker actually ran. For code tasks, read relevant files,
 			run an inspection command, edit files, write files, or run a verification command.
@@ -183,6 +184,7 @@ public class AgentRunner {
 		}
 		JSONObject format = ToolChoiceSchema.build(subtaskDepth < MAX_SUBTASK_DEPTH);
 		CompletionGuard guard = new CompletionGuard();
+		StepLoopState loopState = new StepLoopState();
 
 		for (int turn = 0; turn < MAX_TURNS; turn++) {
 			throwIfCancelled(cancelRequested);
@@ -234,13 +236,14 @@ public class AgentRunner {
 				continue;
 			}
 
-			emitStepThinking(step, thinkingSink);
+			emitStepThinking(step, thinkingSink, loopState);
 
 			JSONArray toolCalls = step.optJSONArray("tool_calls");
 			boolean completedByTool = false;
 			String toolFinalResponse = "";
 			JSONObject call = extractToolCall(step);
 			if (call != null) {
+				loopState.onToolSelected();
 				if (toolCalls != null && toolCalls.length() > 1) {
 					appendUserInstruction(messages,
 							"Only one tool is allowed per step. You sent "
@@ -249,7 +252,20 @@ public class AgentRunner {
 				}
 
 				String name = call.optString("name", "");
-				JSONObject arguments = normalizeArguments(call.opt("arguments"));
+				boolean includeSubtask = subtaskDepth < MAX_SUBTASK_DEPTH;
+				if (!ToolChoiceSchema.isKnownTool(name, includeSubtask)) {
+					appendUserInstruction(messages,
+							"Unknown tool \"" + name + "\". Use tool_call.name with a supported tool only.");
+					continue;
+				}
+				JSONObject arguments = resolveToolArguments(name, messages, tokenSink, thinkingSink, usageSink,
+						cancelRequested, subtaskDepth);
+				if (arguments == null) {
+					appendUserInstruction(messages,
+							"Could not obtain valid arguments for tool \"" + name
+									+ "\". Try the same tool again.");
+					continue;
+				}
 				throwIfCancelled(cancelRequested);
 				ToolResult result = executeTool(name, arguments, workingDirectory, cancelRequested, subtaskDepth,
 						thinkingSink, toolSink, usageSink);
@@ -259,19 +275,21 @@ public class AgentRunner {
 				}
 				appendToolResult(messages, name, arguments, result.getOutput());
 				guard.observe(name, arguments, result.getOutput());
+				loopState.onToolExecuted(result.isComplete());
 
 				if (result.isComplete()) {
 					completedByTool = true;
 					toolFinalResponse = result.getFinalResponse();
 				}
 				if (completedByTool) {
-					String response = toolFinalResponse.isBlank() ? step.optString("response", "") : toolFinalResponse;
+					String response = pickFinalResponse(step, toolFinalResponse);
 					if (subtaskDepth == 0) {
 						String validationError = guard.validateFinalResponse(response);
 						if (validationError != null) {
 							appendUserInstruction(messages, validationError);
 							continue;
 						}
+						response = guard.enrichFinalResponse(response);
 					}
 					if (!response.isBlank()) {
 						emitFinalResponse(response, tokenSink, subtaskDepth);
@@ -282,21 +300,21 @@ public class AgentRunner {
 			}
 
 			if (step.optBoolean("complete", false) || "final".equals(step.optString("step"))) {
-				String response = step.optString("response", "");
+				String response = pickFinalResponse(step, "");
 				if (subtaskDepth == 0) {
 					String validationError = guard.validateFinalResponse(response);
 					if (validationError != null) {
 						appendUserInstruction(messages, validationError);
 						continue;
 					}
+					response = guard.enrichFinalResponse(response);
 				}
 				emitFinalResponse(response, tokenSink, subtaskDepth);
 				return;
 			}
 
-			appendUserInstruction(messages,
-					"No tool was called and the task is not complete. Continue with the next required step. "
-							+ "Call exactly one tool per step, wait for its result, then decide the next step.");
+			loopState.onPlanningWithoutTool(step);
+			appendUserInstruction(messages, loopState.noToolInstruction(step));
 		}
 
 		if (tokenSink != null) {
@@ -612,6 +630,72 @@ public class AgentRunner {
 		return null;
 	}
 
+	/**
+	 * Second Ollama call: enforce tool-specific argument JSON schema after the step selects a tool name.
+	 */
+	private static JSONObject resolveToolArguments(String toolName, JSONArray messages, TokenSink tokenSink,
+			ThinkingSink thinkingSink, UsageSink usageSink, BooleanSupplier cancelRequested, int subtaskDepth)
+			throws IOException {
+		JSONObject format = ToolChoiceSchema.buildToolArgumentsSchema(toolName);
+		if (format == null) {
+			return null;
+		}
+
+		appendUserInstruction(messages,
+				"You selected the \"" + toolName + "\" tool. Return one JSON object with only that tool's "
+						+ "arguments (schema enforced). Do not repeat the step object or tool_call wrapper.");
+
+		JSONObject assistantMessage = OllamaAPI.streamChatCompletion(messages, null, format,
+				new OllamaAPI.ChatStreamListener() {
+					@Override
+					public void onToken(String token) {
+						if (token == null || token.isEmpty()) {
+							return;
+						}
+						if (subtaskDepth > 0) {
+							if (thinkingSink != null) {
+								thinkingSink.accept(prefixSubtaskOutput(token));
+							}
+						} else if (thinkingSink != null) {
+							thinkingSink.accept(token);
+						} else if (tokenSink != null) {
+							tokenSink.accept(token);
+						}
+					}
+
+					@Override
+					public void onThinking(String token) {
+						if (token == null || token.isEmpty() || thinkingSink == null) {
+							return;
+						}
+						if (subtaskDepth > 0) {
+							thinkingSink.accept(prefixSubtaskOutput(token));
+						} else {
+							thinkingSink.accept(token);
+						}
+					}
+
+					@Override
+					public void onUsage(JSONObject usage) {
+						emitStreamingUsage(usage, usageSink);
+					}
+				}, null, cancelRequested);
+		emitUsage(assistantMessage, usageSink);
+		assistantMessage.remove("usage");
+		throwIfCancelled(cancelRequested);
+		messages.put(assistantMessage);
+
+		JSONObject parsed = parseStep(assistantMessage.optString("content", ""));
+		if (parsed == null) {
+			return null;
+		}
+		JSONObject wrapped = parsed.optJSONObject("arguments");
+		if (wrapped != null) {
+			return wrapped;
+		}
+		return parsed;
+	}
+
 	private static JSONObject parseStep(String content) {
 		if (content == null) {
 			return null;
@@ -646,20 +730,6 @@ public class AgentRunner {
 			text = text.substring(0, text.length() - 3);
 		}
 		return text.trim();
-	}
-
-	private static JSONObject normalizeArguments(Object value) {
-		if (value instanceof JSONObject object) {
-			return object;
-		}
-		if (value instanceof String text && !text.isBlank()) {
-			try {
-				return new JSONObject(text);
-			} catch (JSONException ignored) {
-				return new JSONObject().put("value", text);
-			}
-		}
-		return new JSONObject();
 	}
 
 	private static String first(JSONObject object, String... keys) {
@@ -709,8 +779,11 @@ public class AgentRunner {
 		return text.substring(0, maxChars) + "\n... truncated ...";
 	}
 
-	private static void emitStepThinking(JSONObject step, ThinkingSink thinkingSink) {
-		if (thinkingSink == null) {
+	private static void emitStepThinking(JSONObject step, ThinkingSink thinkingSink, StepLoopState loopState) {
+		if (thinkingSink == null || loopState == null) {
+			return;
+		}
+		if (loopState.shouldSuppressThinking(step)) {
 			return;
 		}
 		String thought = step.optString("thought", "");
@@ -720,6 +793,87 @@ public class AgentRunner {
 		}
 		if (!plan.isBlank()) {
 			thinkingSink.accept(plan + "\n");
+		}
+	}
+
+	private static String thoughtPlanFingerprint(JSONObject step) {
+		if (step == null) {
+			return "";
+		}
+		return (step.optString("thought", "") + "|" + step.optString("plan", "")).trim().toLowerCase(Locale.ROOT);
+	}
+
+	private static boolean isSimilarThoughtPlan(String current, String previous) {
+		if (current.isEmpty() || previous.isEmpty()) {
+			return false;
+		}
+		if (current.equals(previous)) {
+			return true;
+		}
+		int prefixLen = Math.min(60, Math.min(current.length(), previous.length()));
+		if (prefixLen < 20) {
+			return false;
+		}
+		String currentPrefix = current.substring(0, prefixLen);
+		return previous.contains(currentPrefix) || current.contains(previous.substring(0, prefixLen));
+	}
+
+	private static final class StepLoopState {
+		private boolean afterToolResult;
+		private int planningStreak;
+		private String lastThoughtPlan = "";
+
+		private void onToolSelected() {
+			planningStreak = 0;
+		}
+
+		private void onToolExecuted(boolean done) {
+			afterToolResult = !done;
+			planningStreak = 0;
+			lastThoughtPlan = "";
+		}
+
+		private void onPlanningWithoutTool(JSONObject step) {
+			String current = thoughtPlanFingerprint(step);
+			if (planningStreak > 0 && isSimilarThoughtPlan(current, lastThoughtPlan)) {
+				planningStreak += 2;
+			} else {
+				planningStreak++;
+			}
+			lastThoughtPlan = current;
+		}
+
+		private boolean shouldSuppressThinking(JSONObject step) {
+			return planningStreak > 0
+					&& isSimilarThoughtPlan(thoughtPlanFingerprint(step), lastThoughtPlan);
+		}
+
+		private String noToolInstruction(JSONObject step) {
+			String stepName = step == null ? "" : step.optString("step", "");
+			if (afterToolResult) {
+				return """
+						The previous turn returned a tool result. Do not replan or restate the same decision.
+						Your next JSON must either:
+						- use step=execute_tool with tool_call.name set to the next tool, or
+						- call done if the task is finished.
+						Do not use think_and_plan, confirm_tool_results, or check_complete without a tool.
+						""";
+			}
+			if ("execute_tool".equals(stepName)) {
+				return "step is execute_tool but tool_call.name is missing. Set tool_call.name to the tool you intend to run.";
+			}
+			if (planningStreak >= 2) {
+				return """
+						You have repeated the same plan without running a tool.
+						Stop planning. Your next JSON must use step=execute_tool with tool_call.name set.
+						Put any brief reasoning in thought, then choose the tool in the same response.
+						""";
+			}
+			return """
+					You decided what to do but did not call a tool.
+					Use step=execute_tool and set tool_call.name in this same response.
+					Do not use think_and_plan again until after the tool runs.
+					""";
 		}
 	}
 
@@ -766,6 +920,21 @@ public class AgentRunner {
 		}
 	}
 
+	private static String pickFinalResponse(JSONObject step, String toolFinalResponse) {
+		String stepResponse = step == null ? "" : step.optString("response", "").trim();
+		String toolResponse = toolFinalResponse == null ? "" : toolFinalResponse.trim();
+		if (stepResponse.isEmpty()) {
+			return toolResponse;
+		}
+		if (toolResponse.isEmpty()) {
+			return stepResponse;
+		}
+		if (stepResponse.contains(toolResponse) || toolResponse.contains(stepResponse)) {
+			return stepResponse.length() >= toolResponse.length() ? stepResponse : toolResponse;
+		}
+		return toolResponse + "\n\n" + stepResponse;
+	}
+
 	private static void appendUserInstruction(JSONArray messages, String content) {
 		messages.put(new JSONObject()
 				.put("role", "user")
@@ -801,6 +970,7 @@ public class AgentRunner {
 	}
 
 	private static class CompletionGuard {
+		private static final int RUN_ANALYSIS_APPEND_CHARS = 6_000;
 		private boolean runScriptExecuted;
 		private String lastRunOutput = "";
 
@@ -814,36 +984,72 @@ public class AgentRunner {
 				return;
 			}
 			String command = first(arguments, "command", "cmd").toLowerCase(Locale.ROOT);
-			boolean ranUnixScript = command.contains("./run.sh") || command.contains("bash run.sh");
-			boolean ranWindowsScript = command.contains("run.bat")
-					|| command.contains("cmd /c run.bat")
-					|| command.contains("cmd.exe /c run.bat");
-			if (ranUnixScript || ranWindowsScript) {
+			if (command.contains("run.sh") || command.contains("run.bat")) {
 				runScriptExecuted = true;
 				lastRunOutput = output == null ? "" : output;
 			}
 		}
 
 		private String validateFinalResponse(String response) {
-			if (!runScriptExecuted) {
-				return """
-						HARD RULE NOT SATISFIED:
-						Do not finish yet.
-						1) Ensure run.sh and run.bat exist in the current directory.
-						2) Run the program via script using bash:
-						   - preferred: run tool with no arguments
-						   - fallback: macOS/Linux ./run.sh (or bash run.sh), Windows cmd /c run.bat
-						3) Then call done with a final response that includes run output analysis (must mention key stdout/stderr findings).
-						""";
+			if (runScriptExecuted) {
+				return null;
 			}
-			String text = response == null ? "" : response.toLowerCase(Locale.ROOT);
-			boolean hasAnalysisWord = text.contains("analysis");
-			boolean mentionsStdoutOrStderr = text.contains("stdout") || text.contains("stderr");
-			if (!hasAnalysisWord || !mentionsStdoutOrStderr) {
-				return "HARD RULE NOT SATISFIED: you ran the script, but your final response is missing run analysis. "
-						+ "Include a 'Run output analysis' section with key stdout/stderr findings before done.";
+			return """
+					HARD RULE NOT SATISFIED:
+					Do not finish yet.
+					1) Ensure run.sh and run.bat exist in the current directory.
+					2) Run the program via script:
+					   - preferred: run tool with no arguments
+					   - fallback: macOS/Linux ./run.sh (or bash run.sh), Windows cmd /c run.bat
+					3) Then call done again.
+					""";
+		}
+
+		private String enrichFinalResponse(String response) {
+			String text = response == null ? "" : response.trim();
+			if (!runScriptExecuted || lastRunOutput.isBlank()) {
+				return text;
 			}
-			return null;
+			if (mentionsRunOutput(text)) {
+				return text;
+			}
+			String summary = summarizeRunOutput(lastRunOutput);
+			if (summary.isBlank()) {
+				return text;
+			}
+			if (text.isEmpty()) {
+				return "Run output analysis:\n" + summary;
+			}
+			return text + "\n\nRun output analysis:\n" + summary;
+		}
+
+		private static boolean mentionsRunOutput(String text) {
+			if (text == null || text.isBlank()) {
+				return false;
+			}
+			String lower = text.toLowerCase(Locale.ROOT);
+			if (lower.contains("run output analysis") || lower.contains("run output:")) {
+				return true;
+			}
+			if (lower.contains("stdout") || lower.contains("stderr")) {
+				return true;
+			}
+			if (lower.contains("standard output") || lower.contains("standard error")) {
+				return true;
+			}
+			return lower.contains("analysis") && (lower.contains("run") || lower.contains("output")
+					|| lower.contains("log") || lower.contains("finding"));
+		}
+
+		private static String summarizeRunOutput(String output) {
+			if (output == null || output.isBlank()) {
+				return "";
+			}
+			String trimmed = output.trim();
+			if (trimmed.length() <= RUN_ANALYSIS_APPEND_CHARS) {
+				return trimmed;
+			}
+			return trimmed.substring(trimmed.length() - RUN_ANALYSIS_APPEND_CHARS);
 		}
 	}
 }

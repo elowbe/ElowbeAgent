@@ -1,5 +1,6 @@
 package com.elowbe.main;
 
+import java.awt.Color;
 import java.awt.Graphics2D;
 import java.awt.RenderingHints;
 import java.awt.event.KeyEvent;
@@ -34,7 +35,7 @@ public class ElowbeAgent extends JinCanvas {
 	private static final File SYSTEM_PROMPT_FILE = resolveSystemPromptFile();
 
 	/** Ollama model used for non-slash agent instructions. */
-	private static String agentModel = "qwen3.6";
+	private static String agentModel = "qwen3.6:27b";
 	private static String ollamaUrl = "http://10.0.0.8:11434";
 	InputWidget commandInput;
 	PrintWidget printWidget;
@@ -48,7 +49,9 @@ public class ElowbeAgent extends JinCanvas {
 	private volatile boolean agentBusy;
 	/** Total input + output tokens consumed by the active or latest agent run. */
 	public volatile long agentTokenCount;
-	/** Total input + output tokens consumed across all agent runs in this session. */
+	/**
+	 * Total input + output tokens consumed across all agent runs in this session.
+	 */
 	public volatile long totalAgentTokenCount;
 	private long tokensAtRunStart;
 	private long runTokenTotal;
@@ -145,9 +148,8 @@ public class ElowbeAgent extends JinCanvas {
 	}
 
 	private JSONObject buildUserMessage(String instruction, JSONArray images) {
-		JSONObject message = new JSONObject()
-				.put("role", "user")
-				.put("content", buildProjectAwareInstruction(instruction));
+		JSONObject message = new JSONObject().put("role", "user").put("content",
+				buildProjectAwareInstruction(instruction));
 		if (images != null && images.length() > 0) {
 			message.put("images", images);
 		}
@@ -159,21 +161,27 @@ public class ElowbeAgent extends JinCanvas {
 		StringBuilder content = new StringBuilder();
 		content.append("Runtime project preflight from ElowbeAgent:\n");
 		content.append("- Current directory: ").append(profile.currentDirectoryPath()).append('\n');
-		content.append("- Java and Maven are the default stack unless the user explicitly requested another language, build tool, or framework.\n");
+		content.append(
+				"- Java and Maven are the default stack unless the user explicitly requested another language, build tool, or framework.\n");
 		content.append("- Application type guidance: ").append(profile.frameworkGuidance).append('\n');
-		content.append("- HARD COMPLETION RULE: before finishing, ensure run.sh and run.bat exist in the current directory, ");
-		content.append("run the program with the script for the current OS, and include a run output analysis with key stdout/stderr findings.\n");
+		content.append(
+				"- HARD COMPLETION RULE: before finishing, ensure run.sh and run.bat exist in the current directory, ");
+		content.append(
+				"run the program with the script for the current OS, and include a run output analysis with key stdout/stderr findings.\n");
 		if (profile.mavenProjectRoot == null) {
-			content.append("- Maven project check: no pom.xml was found in the current directory or any parent directory.\n");
+			content.append(
+					"- Maven project check: no pom.xml was found in the current directory or any parent directory.\n");
 			if (profile.usesJavaMavenDefault) {
-				content.append("- REQUIRED FIRST STEP: create a Maven project in the current directory before doing any feature work. ");
-				content.append("Create pom.xml and the standard src/main/java and src/test/java layout, then continue the user's task inside that Maven project.\n");
+				content.append(
+						"- REQUIRED FIRST STEP: create a Maven project in the current directory before doing any feature work. ");
+				content.append(
+						"Create pom.xml and the standard src/main/java and src/test/java layout, then continue the user's task inside that Maven project.\n");
 			} else {
-				content.append("- The user explicitly requested a non-default stack; follow that request instead of creating a Maven project.\n");
+				content.append(
+						"- The user explicitly requested a non-default stack; follow that request instead of creating a Maven project.\n");
 			}
 		} else {
-			content.append("- Maven project check: pom.xml found at ")
-					.append(profile.mavenProjectRoot.getPath())
+			content.append("- Maven project check: pom.xml found at ").append(profile.mavenProjectRoot.getPath())
 					.append(". Run Maven commands from this project root.\n");
 		}
 		content.append("\nUser request:\n").append(instruction);
@@ -226,7 +234,8 @@ public class ElowbeAgent extends JinCanvas {
 			resolved.append("\n\n");
 		}
 		resolved.append("Available agent skills:\n");
-		resolved.append("When a user task matches a skill description, read that skill's file and follow its instructions.\n");
+		resolved.append(
+				"When a user task matches a skill description, read that skill's file and follow its instructions.\n");
 		for (Skill skill : discoveredSkills) {
 			resolved.append(Skill.formatCatalogEntry(skill)).append('\n');
 		}
@@ -441,11 +450,21 @@ public class ElowbeAgent extends JinCanvas {
 				printWidget.print("<#green>");
 				printWidget.setColor(Colors.green);
 				AgentRunner.run(request, directory, token -> {
-					//printWidget.setColor(Colors.green);
-					//printWidget.print(token);
+//					if (!subtaskActive) {
+//						printWidget.setColor(Colors.green);
+//						printWidget.print(token);
+//					}
+					if(t < 0) {
+						targetColor = Colors.randomColorFromSeed("" + Math.random() * 1000000L, .5f, 1f);
+						t=0;
+					}
 				}, thinking -> {
-					printWidget.setColor(subtaskActive ? Colors.darkblue : Colors.lightgray);
-					printWidget.print(thinking);
+					if(t < 0) {
+						targetColor = Colors.randomColorFromSeed("" + Math.random() * 1000000L, .5f, 1f);
+						t=0;
+					}
+					// printWidget.setColor(subtaskActive ? Colors.darkblue : Colors.lightgray);
+					// printWidget.print(thinking);
 				}, (name, args, result) -> logToolActivity(name, args, result), this::addAgentTokenUsage,
 						() -> agentCancelRequested.get() || Thread.currentThread().isInterrupted());
 
@@ -699,8 +718,8 @@ public class ElowbeAgent extends JinCanvas {
 			return;
 		}
 		String path = primarySkill.sourceFile == null ? "unknown" : primarySkill.sourceFile.getPath();
-		printWidget.println("Primary skill: " + primarySkill.name + " (" + path + ", " + primarySkill.body.length()
-				+ " chars)");
+		printWidget.println(
+				"Primary skill: " + primarySkill.name + " (" + path + ", " + primarySkill.body.length() + " chars)");
 	}
 
 	private void printDiscoveredSkillStatus() {
@@ -785,7 +804,7 @@ public class ElowbeAgent extends JinCanvas {
 		printWidget.println("  /help -commands");
 		printWidget.println("  /model");
 		printWidget.println("  /system -show");
-			printWidget.println("  /skill -list");
+		printWidget.println("  /skill -list");
 	}
 
 	@Override
@@ -814,8 +833,8 @@ public class ElowbeAgent extends JinCanvas {
 			return false;
 		}
 		String name = file.getName().toLowerCase(Locale.ROOT);
-		return name.endsWith(".jpg") || name.endsWith(".jpeg") || name.endsWith(".png")
-				|| name.endsWith(".gif") || name.endsWith(".webp") || name.endsWith(".bmp");
+		return name.endsWith(".jpg") || name.endsWith(".jpeg") || name.endsWith(".png") || name.endsWith(".gif")
+				|| name.endsWith(".webp") || name.endsWith(".bmp");
 	}
 
 	private List<File> takeAttachedPhotos() {
@@ -832,8 +851,30 @@ public class ElowbeAgent extends JinCanvas {
 		return images;
 	}
 
+	Color barColor = Colors.white;
+	Color targetColor = Colors.white;
+	float t = -1;
+
 	public void tick(float delta) {
 		// Change properties and do work here
+
+		if (t >= 0) {
+			t += delta*10;
+			barColor = colorInterpolate(barColor, targetColor, t);
+		}
+		if (t >= 1) {
+			barColor = targetColor;
+			t = -1;
+		}
+	}
+
+	public static Color colorInterpolate(Color from, Color to, float t) {
+		t = Math.max(0f, Math.min(1f, t));
+		int r = Math.round(from.getRed() + (to.getRed() - from.getRed()) * t);
+		int g = Math.round(from.getGreen() + (to.getGreen() - from.getGreen()) * t);
+		int b = Math.round(from.getBlue() + (to.getBlue() - from.getBlue()) * t);
+		int a = Math.round(from.getAlpha() + (to.getAlpha() - from.getAlpha()) * t);
+		return new Color(r, g, b, a);
 	}
 
 	public static String truncatePath(String path) {
@@ -870,21 +911,17 @@ public class ElowbeAgent extends JinCanvas {
 		commandInput.column = 0;
 		commandInput.height = Math.max(3, commandInput.getLines() + 3);
 		if (!agentBusy) {
-			t2d.setColor(Colors.gray);
+			t2d.setColor(Colors.white);
 		} else {
-			t2d.setColor(Colors.darkgreen);
+			t2d.setColor(barColor);
 
 		}
 		t2d.drawBox(0, commandInput.row, JinConsole.getColumns(), commandInput.height - 1);
 
-		if (!agentBusy) {
-			t2d.setColor(Colors.lightgray);
-		} else {
-			t2d.setColor(Colors.green);
-
-		}
+		
+		t2d.setColor(Colors.white);
 		t2d.drawBox(0, 0, JinConsole.getColumns(), JinConsole.getRows());
-		t2d.setColor(Colors.gray);
+		// t2d.setColor(Colors.gray);
 
 		t2d.drawString(" " + truncatePath(directory.getAbsolutePath()) + " ", 2,
 				commandInput.row + 2 + commandInput.height - 4);
@@ -898,13 +935,14 @@ public class ElowbeAgent extends JinCanvas {
 			tokenMeter = agentModel + " [" + agentTokenCount + " run | " + totalAgentTokenCount + " session : "
 					+ tokenCost(totalAgentTokenCount) + "]";
 		} else {
-			tokenMeter = agentModel + " [" + totalAgentTokenCount + " tokens : " + tokenCost(totalAgentTokenCount) + "]";
+			tokenMeter = agentModel + " [" + totalAgentTokenCount + " tokens : " + tokenCost(totalAgentTokenCount)
+					+ "]";
 		}
 		t2d.drawString(" " + tokenMeter + " ", 2, 0);
 	}
-	
+
 	public String tokenCost(float agentTokenCount) {
-		return String.format("$%.2f", ((agentTokenCount/1000000f)* 25f));
+		return String.format("$%.2f", ((agentTokenCount / 1000000f) * 25f));
 	}
 
 	public void destroy() {
@@ -918,7 +956,7 @@ public class ElowbeAgent extends JinCanvas {
 
 	public void keyDown(KeyEvent e) {
 		updateHeldKeys(e, true);
-		if (isControlDown(e) ) {
+		if (isControlDown(e)) {
 			if (e.getKeyCode() == KeyEvent.VK_UP) {
 				printWidget.scroll(e.isShiftDown() ? -5 : -1);
 				e.consume();
@@ -939,9 +977,11 @@ public class ElowbeAgent extends JinCanvas {
 		updateHeldKeys(e, false);
 
 	}
+
 	public boolean isControlDown(KeyEvent e) {
 		return Settings.isMac() ? e.isMetaDown() : e.isControlDown();
 	}
+
 	private void updateHeldKeys(KeyEvent e, boolean pressed) {
 		if (e.getKeyCode() == KeyEvent.VK_CONTROL) {
 			controlHeld = pressed;
@@ -1015,12 +1055,10 @@ public class ElowbeAgent extends JinCanvas {
 
 		private static boolean explicitlyRequestsAnotherStack(String instruction) {
 			String text = normalize(instruction);
-			return mentionsAny(text,
-					"python", "pip", "django", "flask", "fastapi",
-					"javascript", "typescript", "node", "node.js", "npm", "pnpm", "yarn", "react", "vue", "angular",
-					"gradle", "kotlin", "scala", "groovy",
-					"rust", "cargo", "go ", "golang", "c#", ".net", "dotnet",
-					"ruby", "rails", "php", "laravel", "swift");
+			return mentionsAny(text, "python", "pip", "django", "flask", "fastapi", "javascript", "typescript", "node",
+					"node.js", "npm", "pnpm", "yarn", "react", "vue", "angular", "gradle", "kotlin", "scala", "groovy",
+					"rust", "cargo", "go ", "golang", "c#", ".net", "dotnet", "ruby", "rails", "php", "laravel",
+					"swift");
 		}
 
 		private static String normalize(String value) {
