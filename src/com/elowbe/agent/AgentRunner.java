@@ -16,6 +16,7 @@ import org.json.JSONObject;
 import com.elowbe.tools.AgentTools;
 import com.elowbe.tools.ToolChoiceSchema;
 import com.elowbe.tools.ToolResult;
+import com.elowbe.tools.maven.MavenTool;
 
 import lib.console.util.OllamaAPI;
 
@@ -74,17 +75,25 @@ public class AgentRunner {
 			Do not wrap it in markdown.
 
 			Available tools (two-step: pick tool name in tool_call, then fill arguments):
-			read: {"path":"relative/or/absolute/file"}
-			bash: {"command":"shell command","timeout_seconds":120}
+			read: {"path":"relative/or/absolute/file"} — output uses LINE|content format
+			bash: {"command":"shell command","timeout_seconds":120} — NOT for Maven or pom.xml
 			run: {"command":"optional override; defaults to run.sh/run.bat for this OS"}
-			edit: {"path":"file","old":"exact text to replace","new":"replacement text"}
-			write: {"path":"file","content":"new file contents"}
+			edit: {"path":"file","start_line":10,"end_line":12,"new":"replacement text"}
+			write: {"path":"file","content":"new file contents"} — NOT for pom.xml
+			maven: REQUIRED for all Maven/pom work. Actions: init, info, configure, compile, test, package, goal.
+			  init: group_id, artifact_id required; version, java_version, name, description, packaging optional
+			  info: no extra fields
+			  configure: coordinates, properties, add_dependencies, remove_dependencies, add_plugins, remove_plugins
+			  compile/test/package: quiet, skip_tests, args, timeout_seconds optional
+			  goal: goals array or goal string required; quiet, skip_tests, args, timeout_seconds optional
+			  Never use bash mvn when maven can do the job.
 			done: {"response":"final result for the master agent"}
 
 			You must call exactly one tool per step. When you know the tool, use
 			step=execute_tool with tool_call.name in the same response—do not replan first.
 			After each tool result, the next turn must set tool_call.name (next tool or done).
 			Arguments are collected automatically in a follow-up request with a tool-specific schema.
+			That follow-up receives the thought and plan from your tool selection step — arguments must follow that intent.
 			You must call at least one non-done tool before done so the master agent has
 			evidence that this worker actually ran. For code tasks, read relevant files,
 			run an inspection command, edit files, write files, or run a verification command.
@@ -258,7 +267,7 @@ public class AgentRunner {
 							"Unknown tool \"" + name + "\". Use tool_call.name with a supported tool only.");
 					continue;
 				}
-				JSONObject arguments = resolveToolArguments(name, messages, tokenSink, thinkingSink, usageSink,
+				JSONObject arguments = resolveToolArguments(name, step, messages, tokenSink, thinkingSink, usageSink,
 						cancelRequested, subtaskDepth);
 				if (arguments == null) {
 					appendUserInstruction(messages,
@@ -420,15 +429,17 @@ public class AgentRunner {
 		}
 		case "edit" -> {
 			String path = shortPath(first(args, "path", "file"));
-			int oldLen = first(args, "old", "old_text", "target").length();
-			int newLen = first(args, "new", "new_text", "replacement").length();
-			yield "→ edit " + path + " (" + oldLen + " → " + newLen + " chars)";
+			int startLine = firstInt(args, 0, "start_line", "start");
+			int endLine = firstInt(args, 0, "end_line", "end");
+			int newLen = first(args, "new", "new_text", "replacement", "content").length();
+			yield "→ edit " + path + " (lines " + startLine + "-" + endLine + ", " + newLen + " chars)";
 		}
 		case "bash" -> "→ bash: " + truncateInline(first(args, "command", "cmd"), 100);
 		case "run" -> {
 			String cmd = first(args, "command", "cmd");
 			yield cmd.isBlank() ? "→ run (project script)" : "→ run: " + truncateInline(cmd, 100);
 		}
+		case "maven" -> MavenTool.describeAction(args);
 		case "done" -> "→ done";
 		case "subtask" -> "→ subtask: " + truncateInline(first(args, "task", "instruction", "goal"), 120);
 		case "subtask.start" -> "── subagent: " + truncateInline(args.optString("task", "?"), 120) + " ──";
@@ -466,6 +477,7 @@ public class AgentRunner {
 		case "read" -> formatReadSummary(result);
 		case "write", "edit" -> "  ✓ " + truncateInline(firstNonBlankLine(result), 160);
 		case "bash", "run" -> formatCommandOutputSummary(result);
+		case "maven" -> MavenTool.describeResultSummary(result);
 		case "subtask" -> formatSubtaskSummary(result);
 		default -> formatGenericSummary(result);
 		};
@@ -481,6 +493,7 @@ public class AgentRunner {
 		case "edit" -> line.startsWith("edit:") && !line.startsWith("edit: updated");
 		case "write" -> line.startsWith("write:") && !line.startsWith("write: wrote");
 		case "bash" -> line.startsWith("bash:") && !line.equals("bash: cancelled");
+		case "maven" -> line.startsWith("maven:") || (line.startsWith("maven ") && line.contains("(exit ") && !line.contains("(exit 0)"));
 		case "run" -> line.startsWith("run:") && line.contains("error");
 		default -> false;
 		};
@@ -632,18 +645,17 @@ public class AgentRunner {
 
 	/**
 	 * Second Ollama call: enforce tool-specific argument JSON schema after the step selects a tool name.
+	 * The selection step's thought and plan are passed through so argument generation follows that intent.
 	 */
-	private static JSONObject resolveToolArguments(String toolName, JSONArray messages, TokenSink tokenSink,
-			ThinkingSink thinkingSink, UsageSink usageSink, BooleanSupplier cancelRequested, int subtaskDepth)
-			throws IOException {
+	private static JSONObject resolveToolArguments(String toolName, JSONObject selectionStep, JSONArray messages,
+			TokenSink tokenSink, ThinkingSink thinkingSink, UsageSink usageSink, BooleanSupplier cancelRequested,
+			int subtaskDepth) throws IOException {
 		JSONObject format = ToolChoiceSchema.buildToolArgumentsSchema(toolName);
 		if (format == null) {
 			return null;
 		}
 
-		appendUserInstruction(messages,
-				"You selected the \"" + toolName + "\" tool. Return one JSON object with only that tool's "
-						+ "arguments (schema enforced). Do not repeat the step object or tool_call wrapper.");
+		appendUserInstruction(messages, toolArgumentPrompt(toolName, selectionStep));
 
 		JSONObject assistantMessage = OllamaAPI.streamChatCompletion(messages, null, format,
 				new OllamaAPI.ChatStreamListener() {
@@ -691,9 +703,75 @@ public class AgentRunner {
 		}
 		JSONObject wrapped = parsed.optJSONObject("arguments");
 		if (wrapped != null) {
-			return wrapped;
+			return normalizeToolArguments(toolName, selectionStep, wrapped);
 		}
-		return parsed;
+		return normalizeToolArguments(toolName, selectionStep, parsed);
+	}
+
+	private static JSONObject normalizeToolArguments(String toolName, JSONObject selectionStep, JSONObject arguments) {
+		if (!"maven".equals(toolName) || arguments == null || selectionStep == null) {
+			return arguments;
+		}
+		String selectedIntent = (selectionStep.optString("thought", "") + "\n" + selectionStep.optString("plan", ""))
+				.toLowerCase(Locale.ROOT);
+		String generatedAction = arguments.optString("action", "").trim().toLowerCase(Locale.ROOT);
+		String intendedAction = intendedMavenAction(selectedIntent);
+		if (!intendedAction.isBlank() && ("info".equals(generatedAction) || generatedAction.isBlank())) {
+			arguments.put("action", intendedAction);
+		}
+		return arguments;
+	}
+
+	private static String intendedMavenAction(String text) {
+		if (text == null || text.isBlank()) {
+			return "";
+		}
+		for (String action : new String[] { "init", "configure", "compile", "test", "package", "goal" }) {
+			if (text.contains("maven " + action) || text.contains("action " + action)
+					|| text.contains("\"action\":\"" + action + "\"")
+					|| text.contains("\"action\": \"" + action + "\"")) {
+				return action;
+			}
+		}
+		if (text.contains("javafx:run") || text.contains("spring-boot:run") || text.contains("exec:java")) {
+			return "goal";
+		}
+		return "";
+	}
+
+	private static String toolArgumentPrompt(String toolName, JSONObject selectionStep) {
+		StringBuilder prompt = new StringBuilder();
+		prompt.append("You selected the \"").append(toolName).append("\" tool in your previous step.\n");
+		prompt.append("Your tool arguments MUST match the thought and plan from that step.\n");
+		prompt.append("Do not ignore your previous thought/plan or repeat a prior failed tool call.\n\n");
+
+		if (selectionStep != null) {
+			String thought = selectionStep.optString("thought", "").trim();
+			String plan = selectionStep.optString("plan", "").trim();
+			if (!thought.isBlank()) {
+				prompt.append("Thought from tool selection:\n").append(thought).append("\n\n");
+			}
+			if (!plan.isBlank()) {
+				prompt.append("Plan from tool selection:\n").append(plan).append("\n\n");
+			}
+			String stepName = selectionStep.optString("step", "").trim();
+			if (!stepName.isBlank()) {
+				prompt.append("Selection step: ").append(stepName).append('\n');
+			}
+			JSONObject toolCall = selectionStep.optJSONObject("tool_call");
+			if (toolCall != null && !toolCall.optString("name", "").isBlank()) {
+				prompt.append("Selected tool: ").append(toolCall.optString("name")).append('\n');
+			}
+			prompt.append('\n');
+		}
+
+		if ("maven".equals(toolName)) {
+			prompt.append(MavenTool.buildArgumentPrompt());
+		} else {
+			prompt.append("Return one JSON object with only that tool's arguments (schema enforced). ");
+			prompt.append("Do not repeat the step object or tool_call wrapper.");
+		}
+		return prompt.toString().trim();
 	}
 
 	private static JSONObject parseStep(String content) {
@@ -742,6 +820,25 @@ public class AgentRunner {
 			}
 		}
 		return "";
+	}
+
+	private static int firstInt(JSONObject object, int defaultValue, String... keys) {
+		if (object == null) {
+			return defaultValue;
+		}
+		for (String key : keys) {
+			if (object.has(key) && !object.isNull(key)) {
+				Object raw = object.get(key);
+				if (raw instanceof Number number) {
+					return number.intValue();
+				}
+				try {
+					return Integer.parseInt(String.valueOf(raw).trim());
+				} catch (NumberFormatException ignored) {
+				}
+			}
+		}
+		return defaultValue;
 	}
 
 	private static String prefixSubtaskOutput(String text) {
@@ -852,7 +949,9 @@ public class AgentRunner {
 			String stepName = step == null ? "" : step.optString("step", "");
 			if (afterToolResult) {
 				return """
-						The previous turn returned a tool result. Do not replan or restate the same decision.
+						The previous turn returned a tool result as a user message starting with Tool "..." finished.
+						Read that result carefully before acting.
+						If the tool failed, fix the cause or try a different approach — do not repeat the same failing tool call.
 						Your next JSON must either:
 						- use step=execute_tool with tool_call.name set to the next tool, or
 						- call done if the task is finished.
@@ -878,15 +977,21 @@ public class AgentRunner {
 	}
 
 	private static void appendToolResult(JSONArray messages, String name, JSONObject arguments, String output) {
-		JSONObject message = new JSONObject();
-		message.put("role", "tool");
-		message.put("name", name);
-		message.put("content", new JSONObject()
-				.put("tool", name)
-				.put("arguments", arguments == null ? new JSONObject() : arguments)
-				.put("result", output == null ? "" : output)
-				.toString());
-		messages.put(message);
+		String resultText = output == null ? "" : output;
+		String argumentText = arguments == null ? "{}" : arguments.toString(2);
+		String content = """
+				Tool "%s" finished. Read this result before choosing your next action.
+				If the tool failed or returned an error, do not repeat the same call without fixing the cause.
+
+				Arguments:
+				%s
+
+				Result:
+				%s
+				""".formatted(name, argumentText, resultText);
+		messages.put(new JSONObject()
+				.put("role", "user")
+				.put("content", content.trim()));
 	}
 
 	private static void emitFinalResponse(String response, TokenSink tokenSink, int subtaskDepth) {

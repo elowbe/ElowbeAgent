@@ -62,6 +62,28 @@ public final class AgentSettings {
 		return projectsDirectory;
 	}
 
+	public boolean isProjectsRoot(File directory) {
+		if (directory == null) {
+			return false;
+		}
+		try {
+			return directory.getCanonicalFile().equals(projectsDirectory.getCanonicalFile());
+		} catch (IOException e) {
+			return directory.getAbsoluteFile().equals(projectsDirectory.getAbsoluteFile());
+		}
+	}
+
+	public static boolean isProjectsRoot(File directory, File projectsDirectory) {
+		if (directory == null || projectsDirectory == null) {
+			return false;
+		}
+		try {
+			return directory.getCanonicalFile().equals(projectsDirectory.getCanonicalFile());
+		} catch (IOException e) {
+			return directory.getAbsoluteFile().equals(projectsDirectory.getAbsoluteFile());
+		}
+	}
+
 	private void save() throws IOException {
 		if (!SETTINGS_DIR.exists() && !SETTINGS_DIR.mkdirs()) {
 			throw new IOException("Could not create settings directory: " + SETTINGS_DIR.getPath());

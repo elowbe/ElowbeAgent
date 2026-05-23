@@ -9,6 +9,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
 import java.util.Set;
@@ -19,6 +22,8 @@ import java.util.function.BooleanSupplier;
 import org.json.JSONObject;
 
 import com.elowbe.agent.AgentRunner;
+import com.elowbe.main.AgentSettings;
+import com.elowbe.tools.maven.MavenTool;
 
 public class AgentTools {
 	private static final int MAX_OUTPUT_CHARS = 40_000;
@@ -93,6 +98,7 @@ public class AgentTools {
 			case "run" -> run(arguments, workingDirectory, cancelRequested);
 			case "edit" -> edit(arguments, workingDirectory);
 			case "write" -> write(arguments, workingDirectory);
+			case "maven" -> MavenTool.execute(arguments, workingDirectory, cancelRequested);
 			case "subtask" -> subtask(arguments, workingDirectory, cancelRequested, subtaskDepth);
 			case "done" -> done(arguments);
 			default -> ToolResult.output("Tool error: unknown tool: " + name);
@@ -117,7 +123,7 @@ public class AgentTools {
 			return ToolResult.output("read: not a file: " + file.getPath());
 		}
 		String content = Files.readString(file.toPath(), StandardCharsets.UTF_8);
-		return ToolResult.output(truncate(content));
+		return ToolResult.output(truncate(formatWithLineNumbers(content)));
 	}
 
 	private static ToolResult bash(JSONObject arguments, File workingDirectory, BooleanSupplier cancelRequested)
@@ -244,6 +250,9 @@ public class AgentTools {
 
 	private static ToolResult run(JSONObject arguments, File workingDirectory, BooleanSupplier cancelRequested)
 			throws IOException, InterruptedException {
+		if (AgentSettings.load().isProjectsRoot(workingDirectory)) {
+			return ToolResult.output("run: open a project first; run.sh/run.bat cannot be used in the projects folder");
+		}
 		String command = first(arguments, "command", "cmd");
 		if (command.isBlank()) {
 			String os = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
@@ -273,10 +282,14 @@ public class AgentTools {
 
 	private static ToolResult edit(JSONObject arguments, File workingDirectory) throws IOException {
 		File file = resolvePath(first(arguments, "path", "file"), workingDirectory);
-		String oldText = first(arguments, "old", "old_text", "target");
-		String newText = first(arguments, "new", "new_text", "replacement");
-		if (oldText.isEmpty()) {
-			return ToolResult.output("edit: missing old text");
+		int startLine = firstInt(arguments, 0, "start_line", "start");
+		int endLine = firstInt(arguments, 0, "end_line", "end");
+		String newText = first(arguments, "new", "new_text", "replacement", "content");
+		if (startLine < 1) {
+			return ToolResult.output("edit: missing or invalid start_line (must be >= 1)");
+		}
+		if (endLine < startLine - 1) {
+			return ToolResult.output("edit: end_line must be >= start_line - 1");
 		}
 		if (!file.isFile()) {
 			return ToolResult.output("edit: not a file: " + file.getPath());
@@ -284,17 +297,30 @@ public class AgentTools {
 
 		Path path = file.toPath();
 		String content = Files.readString(path, StandardCharsets.UTF_8);
-		int first = content.indexOf(oldText);
-		if (first < 0) {
-			return ToolResult.output("edit: old text not found");
-		}
-		if (content.indexOf(oldText, first + oldText.length()) >= 0) {
-			return ToolResult.output("edit: old text is ambiguous; it appears more than once");
+		List<String> lines = splitLines(content);
+		List<String> replacement = splitNewText(newText);
+		boolean insert = endLine == startLine - 1;
+
+		if (insert) {
+			if (startLine > lines.size() + 1) {
+				return ToolResult.output("edit: start_line " + startLine + " is out of range (file has "
+						+ lines.size() + " lines; use " + (lines.size() + 1) + " to append)");
+			}
+			lines.addAll(startLine - 1, replacement);
+		} else {
+			if (endLine > lines.size()) {
+				return ToolResult.output("edit: end_line " + endLine + " is out of range (file has "
+						+ lines.size() + " lines)");
+			}
+			lines.subList(startLine - 1, endLine).clear();
+			lines.addAll(startLine - 1, replacement);
 		}
 
-		String updated = content.substring(0, first) + newText + content.substring(first + oldText.length());
-		Files.writeString(path, updated, StandardCharsets.UTF_8);
-		return ToolResult.output("edit: updated " + file.getPath());
+		Files.writeString(path, joinLines(lines, content), StandardCharsets.UTF_8);
+		int replaced = insert ? 0 : endLine - startLine + 1;
+		int inserted = replacement.size();
+		return ToolResult.output("edit: updated " + file.getPath() + " (replaced " + replaced + " line(s) with "
+				+ inserted + " line(s))");
 	}
 
 	private static ToolResult write(JSONObject arguments, File workingDirectory) throws IOException {
@@ -333,6 +359,63 @@ public class AgentTools {
 			}
 		}
 		return "";
+	}
+
+	private static int firstInt(JSONObject object, int defaultValue, String... keys) {
+		for (String key : keys) {
+			if (object.has(key) && !object.isNull(key)) {
+				Object raw = object.get(key);
+				if (raw instanceof Number number) {
+					return number.intValue();
+				}
+				try {
+					return Integer.parseInt(String.valueOf(raw).trim());
+				} catch (NumberFormatException ignored) {
+				}
+			}
+		}
+		return defaultValue;
+	}
+
+	private static String formatWithLineNumbers(String content) {
+		List<String> lines = splitLines(content);
+		if (lines.isEmpty()) {
+			return "1|";
+		}
+		int width = String.valueOf(lines.size()).length();
+		StringBuilder numbered = new StringBuilder();
+		for (int i = 0; i < lines.size(); i++) {
+			if (i > 0) {
+				numbered.append('\n');
+			}
+			numbered.append(String.format(Locale.ROOT, "%" + width + "d|%s", i + 1, lines.get(i)));
+		}
+		return numbered.toString();
+	}
+
+	private static List<String> splitLines(String content) {
+		if (content.isEmpty()) {
+			return new ArrayList<>();
+		}
+		return new ArrayList<>(Arrays.asList(content.split("\n", -1)));
+	}
+
+	private static List<String> splitNewText(String newText) {
+		if (newText == null || newText.isEmpty()) {
+			return new ArrayList<>();
+		}
+		return new ArrayList<>(Arrays.asList(newText.split("\n", -1)));
+	}
+
+	private static String joinLines(List<String> lines, String originalContent) {
+		if (lines.isEmpty()) {
+			return "";
+		}
+		String joined = String.join("\n", lines);
+		if (!originalContent.isEmpty() && originalContent.endsWith("\n")) {
+			return joined + "\n";
+		}
+		return joined;
 	}
 
 	private static String stripQuotes(String value) {

@@ -49,6 +49,10 @@ public class ElowbeAgent extends JinCanvas {
 	private Skill primarySkill = Skill.parse("", null);
 	/** Additional skills discovered under .cursor/skills/ or skills/. */
 	private final List<Skill> discoveredSkills = new ArrayList<>();
+	/** Skills chosen for the current agent run (set before each run). */
+	private List<Skill> selectedSkillsForRun = List.of();
+	/** Diagnostic when skill selection yields none (for console display). */
+	private String lastSkillSelectionNote;
 	private final JSONArray chatHistory = new JSONArray();
 	private volatile boolean agentBusy;
 	/** Total input + output tokens consumed by the active or latest agent run. */
@@ -87,7 +91,7 @@ public class ElowbeAgent extends JinCanvas {
 		// 30 rows.
 		OllamaAPI.BASE_URL = ollamaUrl;
 		Runtime.getRuntime().addShutdownHook(new Thread(ElowbeAgent::shutdownAllProcesses, "elowbe-agent-shutdown"));
-		JinConsole.start(new ElowbeAgent(), "Agent", 90, 40, 960, 720);
+		JinConsole.start(new ElowbeAgent(), "Agent", 120, 40, 960, 720);
 	}
 
 	public void init() {
@@ -161,10 +165,8 @@ public class ElowbeAgent extends JinCanvas {
 		}
 
 		Map<String, Skill> byPath = new LinkedHashMap<>();
-		for (File skillsRoot : Skill.skillDirectoryRoots(directory)) {
-			for (Skill skill : Skill.discoverInDirectory(skillsRoot)) {
-				byPath.put(skill.displayPath(), skill);
-			}
+		for (Skill skill : Skill.discoverAll(directory)) {
+			byPath.put(skill.displayPath(), skill);
 		}
 		if (primarySkill.sourceFile != null && primarySkill.sourceFile.isFile()) {
 			byPath.remove(primarySkill.displayPath());
@@ -188,6 +190,8 @@ public class ElowbeAgent extends JinCanvas {
 		content.append("- Current directory: ").append(profile.currentDirectoryPath()).append('\n');
 		content.append(
 				"- Java and Maven are the default stack unless the user explicitly requested another language, build tool, or framework.\n");
+		content.append(
+				"- ALWAYS use the maven tool (not bash mvn, not write/edit) for pom.xml and Maven builds.\n");
 		content.append("- Application type guidance: ").append(profile.frameworkGuidance).append('\n');
 		content.append(
 				"- HARD COMPLETION RULE: before finishing, ensure run.sh and run.bat exist in the current directory, ");
@@ -200,14 +204,16 @@ public class ElowbeAgent extends JinCanvas {
 				content.append(
 						"- REQUIRED FIRST STEP: create a Maven project in the current directory before doing any feature work. ");
 				content.append(
-						"Create pom.xml and the standard src/main/java and src/test/java layout, then continue the user's task inside that Maven project.\n");
+						"Use the maven tool with action init (group_id, artifact_id, java_version), then configure dependencies/plugins as needed. ");
+				content.append(
+						"Do not write or edit pom.xml directly unless the maven tool cannot express the change.\n");
 			} else {
 				content.append(
 						"- The user explicitly requested a non-default stack; follow that request instead of creating a Maven project.\n");
 			}
 		} else {
 			content.append("- Maven project check: pom.xml found at ").append(profile.mavenProjectRoot.getPath())
-					.append(". Run Maven commands from this project root.\n");
+					.append(". Use the maven tool for pom changes and builds.\n");
 		}
 		content.append("\nUser request:\n").append(instruction);
 		return content.toString();
@@ -243,27 +249,37 @@ public class ElowbeAgent extends JinCanvas {
 	}
 
 	private void appendSkillSupplement(StringBuilder resolved) {
-		if (primarySkill.hasBody()) {
-			if (resolved.length() > 0) {
-				resolved.append("\n\n");
-			}
-			resolved.append("Skill supplement (").append(primarySkill.name).append("):\n");
-			resolved.append(primarySkill.body);
-		}
-
-		if (discoveredSkills.isEmpty()) {
+		if (selectedSkillsForRun.isEmpty()) {
 			return;
 		}
 
 		if (resolved.length() > 0) {
 			resolved.append("\n\n");
 		}
-		resolved.append("Available agent skills:\n");
-		resolved.append(
-				"When a user task matches a skill description, read that skill's file and follow its instructions.\n");
-		for (Skill skill : discoveredSkills) {
-			resolved.append(Skill.formatCatalogEntry(skill)).append('\n');
+		resolved.append("Selected skills for this task. Follow these instructions when they apply to the work:\n");
+		for (Skill skill : selectedSkillsForRun) {
+			try {
+				resolved.append('\n').append(Skill.formatSkillSupplement(skill));
+			} catch (IOException e) {
+				resolved.append("\n### ").append(skill.name).append("\n(load failed: ")
+						.append(e.getMessage()).append(")\n");
+			}
 		}
+		resolved.append(
+				"\nAdhere to the selected skill guidance above; do not ignore relevant instructions from those skills.\n");
+	}
+
+	private List<Skill> collectSkillCandidates() {
+		loadSkills();
+		Map<String, Skill> candidates = new LinkedHashMap<>();
+		for (Skill skill : discoveredSkills) {
+			candidates.put(skill.displayPath(), skill);
+		}
+		if (primarySkill.sourceFile != null && primarySkill.sourceFile.isFile()
+				&& (primarySkill.hasBody() || primarySkill.hasDescription())) {
+			candidates.putIfAbsent(primarySkill.displayPath(), primarySkill);
+		}
+		return new ArrayList<>(candidates.values());
 	}
 
 	private String detectOperatingSystem() {
@@ -471,9 +487,6 @@ public class ElowbeAgent extends JinCanvas {
 
 		JSONObject userMessage = buildUserMessage(instruction, images);
 
-		JSONArray request = buildChatRequest(userMessage);
-		int turnStart = request.length() - 1;
-
 		agentTokenCount = 0;
 		tokensAtRunStart = totalAgentTokenCount;
 		runTokenTotal = 0;
@@ -486,13 +499,55 @@ public class ElowbeAgent extends JinCanvas {
 			String previousModel = OllamaAPI.model;
 			OllamaAPI.model = agentModel;
 			try {
+				selectedSkillsForRun = List.of();
+				lastSkillSelectionNote = null;
+				List<Skill> skillCandidates = collectSkillCandidates();
+				printWidget.setColor(Colors.lightgray);
+				if (skillCandidates.isEmpty()) {
+					printWidget.println("Skill selection: no skills found on disk");
+					File agentHome = Skill.resolveAgentHomeDirectory();
+					if (agentHome != null) {
+						printWidget.println("  agent home: " + agentHome.getPath());
+					}
+					for (File root : Skill.skillDirectoryRootsForAgent(directory)) {
+						printWidget.println("  searched: " + root.getPath()
+								+ (root.isDirectory() ? "" : " (missing)"));
+					}
+				} else {
+					printWidget.println("Skill selection: asking LLM (" + skillCandidates.size() + " candidates)...");
+					try {
+						SkillSelector.SkillSelectionResult selection = SkillSelector.select(instruction,
+								skillCandidates, directory,
+								() -> agentCancelRequested.get() || Thread.currentThread().isInterrupted(),
+								this::addAgentTokenUsage);
+						selectedSkillsForRun = selection.skills();
+						lastSkillSelectionNote = selection.note();
+					} catch (IOException e) {
+						if (agentCancelRequested.get() || Thread.currentThread().isInterrupted()) {
+							throw e;
+						}
+						lastSkillSelectionNote = e.getMessage();
+						printWidget.println("Skill selection failed: " + e.getMessage()
+								+ " (continuing without skills)");
+					}
+				}
+				if (agentCancelRequested.get() || Thread.currentThread().isInterrupted()) {
+					printWidget.println();
+					printWidget.println("Agent cancelled.");
+					return;
+				}
+				logSkillSelection();
+
+				JSONArray request = buildChatRequest(userMessage);
+				int turnStart = request.length() - 1;
+
 				printWidget.print("<#green>");
 				printWidget.setColor(Colors.green);
 				AgentRunner.run(request, directory, token -> {
-//					if (!subtaskActive) {
-//						printWidget.setColor(Colors.green);
-//						printWidget.print(token);
-//					}
+					if (!subtaskActive) {
+						printWidget.setColor(Colors.green);
+						printWidget.print(token);
+					}
 					if(t < 0) {
 						targetColor = Colors.randomColorFromSeed("" + Math.random() * 1000000L, .95f, 1f);
 						t=0;
@@ -514,7 +569,11 @@ public class ElowbeAgent extends JinCanvas {
 					printWidget.println();
 					ensureGitRepository(false);
 					printWidget.setColor(Colors.lightblue);
-					printWidget.println("Task complete. Run /review to inspect changes and commit.");
+					if (!agentSettings.isProjectsRoot(directory)) {
+						printWidget.println("Task complete. Run /review to inspect changes and commit.");
+					} else {
+						printWidget.println("Task complete. Use /open or /new to work inside a project.");
+					}
 					printWidget.setColor(Colors.white);
 				}
 			} catch (IOException e) {
@@ -543,6 +602,46 @@ public class ElowbeAgent extends JinCanvas {
 		}, "elowbe-agent-chat");
 		agentThread = thread;
 		thread.start();
+	}
+
+	private void logSkillSelection() {
+		printWidget.println();
+		printWidget.print("<#lightblue>");
+		printWidget.setColor(Colors.lightblue);
+		if (selectedSkillsForRun.isEmpty()) {
+			printWidget.println("→ skills: (none)");
+			if (lastSkillSelectionNote != null && !lastSkillSelectionNote.isBlank()) {
+				printWidget.setColor(Colors.lightgray);
+				printWidget.println("  " + lastSkillSelectionNote);
+			}
+		} else {
+			printWidget.println("→ skills selected (" + selectedSkillsForRun.size() + "):");
+			printWidget.setColor(Colors.lightgray);
+			for (Skill skill : selectedSkillsForRun) {
+				printWidget.println("  ✓ " + skill.name + " [" + skill.learnCatalogPath(directory) + "]");
+			}
+		}
+		printWidget.print("<#green>");
+		printWidget.setColor(Colors.green);
+	}
+
+	private String formatSelectedSkillsStatus() {
+		if (selectedSkillsForRun.isEmpty()) {
+			return "";
+		}
+		StringBuilder status = new StringBuilder(" | skills: ");
+		for (int i = 0; i < selectedSkillsForRun.size(); i++) {
+			if (i > 0) {
+				status.append(", ");
+			}
+			status.append(selectedSkillsForRun.get(i).learnCatalogPath(directory));
+		}
+		String text = status.toString();
+		int max = Math.max(20, JinConsole.getColumns() - 8);
+		if (text.length() > max) {
+			return text.substring(0, max - 3) + "...";
+		}
+		return text;
 	}
 
 	private void logToolActivity(String name, JSONObject args, String result) {
@@ -576,7 +675,9 @@ public class ElowbeAgent extends JinCanvas {
 		} else {
 			printWidget.print("<#yellow>");
 			printWidget.setColor(Colors.yellow);
-			printWidget.println(AgentRunner.formatToolAction(name, args));
+			for (String line : AgentRunner.formatToolAction(name, args).split("\n", -1)) {
+				printWidget.println(line);
+			}
 			String summary = AgentRunner.formatToolResultSummary(name, result);
 			if (!summary.isBlank()) {
 				printWidget.setColor(Colors.lightgray);
@@ -826,14 +927,14 @@ public class ElowbeAgent extends JinCanvas {
 		if (discoveredSkills.isEmpty()) {
 			printWidget.println("Discovered skills: (none)");
 			printWidget.println("Searched skill roots:");
-			for (File root : Skill.skillDirectoryRoots(directory)) {
+			for (File root : Skill.skillDirectoryRootsForAgent(directory)) {
 				printWidget.println("  " + root.getPath());
 			}
 			return;
 		}
 		printWidget.println("Discovered skills:");
 		for (Skill skill : discoveredSkills) {
-			printWidget.println("  " + Skill.formatCatalogEntry(skill));
+			printWidget.println("  " + Skill.formatCatalogEntry(skill, directory));
 		}
 	}
 
@@ -875,6 +976,9 @@ public class ElowbeAgent extends JinCanvas {
 	}
 
 	private void ensureGitRepository(boolean verbose) {
+		if (agentSettings != null && agentSettings.isProjectsRoot(directory)) {
+			return;
+		}
 		try {
 			if (GitService.isRepository(directory)) {
 				return;
@@ -891,6 +995,10 @@ public class ElowbeAgent extends JinCanvas {
 	private void startGitReview() {
 		if (agentBusy) {
 			printWidget.println("Agent is still responding. Please wait.");
+			return;
+		}
+		if (agentSettings.isProjectsRoot(directory)) {
+			printWidget.println("Open a project first with /open or /new. Git review is not available in the projects folder.");
 			return;
 		}
 		if (gitReviewWidget != null && !gitReviewWidget.isDestroyed()) {
@@ -1059,6 +1167,10 @@ public class ElowbeAgent extends JinCanvas {
 	private void handleRunCommand() {
 		if (agentBusy) {
 			printWidget.println("Agent is still responding. Please wait.");
+			return;
+		}
+		if (agentSettings.isProjectsRoot(directory)) {
+			printWidget.println("Open a project first with /open or /new. /run cannot be used in the projects folder.");
 			return;
 		}
 		if (runBusy) {
@@ -1561,7 +1673,7 @@ public class ElowbeAgent extends JinCanvas {
 		String tokenMeter;
 		if (agentBusy) {
 			tokenMeter = agentModel + " [" + agentTokenCount + " run | " + totalAgentTokenCount + " session : "
-					+ tokenCost(totalAgentTokenCount) + "]";
+					+ tokenCost(totalAgentTokenCount) + "]" + formatSelectedSkillsStatus();
 		} else {
 			tokenMeter = agentModel + " [" + totalAgentTokenCount + " tokens : " + tokenCost(totalAgentTokenCount)
 					+ "]";

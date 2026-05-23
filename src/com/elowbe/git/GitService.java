@@ -18,6 +18,8 @@ import java.util.regex.Pattern;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
+import com.elowbe.main.AgentSettings;
+
 import lib.console.util.OllamaAPI;
 
 /**
@@ -39,6 +41,71 @@ public final class GitService {
 
 	private static final Pattern SUBJECT_BODY = Pattern.compile("(?s)^SUBJECT:\\s*(.+?)\\s*BODY:\\s*(.*)$");
 
+	private static final String DEFAULT_GITIGNORE = """
+			# Compiled Java
+			*.class
+
+			# Logs
+			*.log
+
+			# Package files
+			*.jar
+			*.war
+			*.nar
+			*.ear
+			*.zip
+			*.tar.gz
+			*.rar
+
+			# Maven
+			target/
+			pom.xml.tag
+			pom.xml.releaseBackup
+			pom.xml.versionsBackup
+			pom.xml.next
+			release.properties
+			dependency-reduced-pom.xml
+			buildNumber.properties
+
+			# IDE
+			.idea/
+			*.iml
+			*.iws
+			*.ipr
+			.classpath
+			.project
+			.settings/
+			bin/
+			nbproject/private/
+			built/
+			dist/
+			.vscode/
+
+			# Gradle
+			.gradle/
+			build/
+
+			# Node
+			node_modules/
+
+			# macOS
+			.DS_Store
+			.AppleDouble
+			.LSOverride
+			Icon
+			._*
+			.Spotlight-V100
+			.Trashes
+
+			# Windows
+			Thumbs.db
+			ehthumbs.db
+			Desktop.ini
+
+			# Cursor / local tooling
+			.cursor/
+			""";
+
 	private GitService() {
 	}
 
@@ -50,16 +117,29 @@ public final class GitService {
 		if (directory == null) {
 			throw new IOException("No working directory");
 		}
+		if (AgentSettings.isProjectsRoot(directory, AgentSettings.load().getProjectsDirectory())) {
+			return;
+		}
 		if (!directory.exists() && !directory.mkdirs()) {
 			throw new IOException("Could not create directory: " + directory.getPath());
 		}
 		if (isRepository(directory)) {
+			ensureGitIgnore(directory);
 			return;
 		}
 		CommandResult init = runGit(directory, "init");
 		if (init.exitCode != 0) {
 			throw new IOException("git init failed: " + init.combinedOutput());
 		}
+		ensureGitIgnore(directory);
+	}
+
+	private static void ensureGitIgnore(File directory) throws IOException {
+		File gitignore = new File(directory, ".gitignore");
+		if (gitignore.isFile()) {
+			return;
+		}
+		Files.writeString(gitignore.toPath(), DEFAULT_GITIGNORE, StandardCharsets.UTF_8);
 	}
 
 	public static List<FileChange> listChanges(File directory) throws IOException, InterruptedException {

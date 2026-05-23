@@ -37,11 +37,13 @@ public class ToolChoiceSchema {
 								+ "After a tool result, the next turn must call another tool or done."));
 		properties.put("thought", new JSONObject()
 				.put("type", "string")
-				.put("description", "One short sentence only. Do not repeat prior thoughts."));
+				.put("description",
+						"One short sentence: why you are calling this tool now. The argument step will receive this."));
 		properties.put("plan", new JSONObject()
 				.put("type", "string")
 				.put("description",
-						"Next action in one line, or empty. If you know the tool, use step=execute_tool with tool_call.name instead of replanning."));
+						"What this tool call will do. When selecting a tool, include the intended arguments here "
+								+ "(e.g. maven init with artifact_id lwjgl-cube). The argument step must follow this plan."));
 		properties.put("tool_call", toolSelectionSchema(includeSubtask));
 		properties.put("complete", new JSONObject()
 				.put("type", "boolean")
@@ -72,11 +74,17 @@ public class ToolChoiceSchema {
 						.put("path", stringProperty("Relative or absolute file path to create or overwrite."))
 						.put("content", stringProperty("Full file contents.")));
 		case "edit" -> argumentsSchema(
-				new JSONArray().put("path").put("old").put("new"),
+				new JSONArray().put("path").put("start_line").put("end_line").put("new"),
 				new JSONObject()
 						.put("path", stringProperty("Relative or absolute file path to edit."))
-						.put("old", stringProperty("Exact text to replace (must appear once in the file)."))
-						.put("new", stringProperty("Replacement text.")));
+						.put("start_line", integerProperty(
+								"1-based start line (inclusive). Use read output line numbers."))
+						.put("end_line", new JSONObject()
+								.put("type", "integer")
+								.put("minimum", 0)
+								.put("description",
+										"1-based end line (inclusive). Set to start_line - 1 to insert without deleting."))
+						.put("new", stringProperty("Replacement text for the line range. Use empty string to delete lines.")));
 		case "bash" -> argumentsSchema(
 				new JSONArray().put("command"),
 				new JSONObject()
@@ -99,6 +107,7 @@ public class ToolChoiceSchema {
 		case "done" -> argumentsSchema(
 				new JSONArray().put("response"),
 				new JSONObject().put("response", stringProperty("Final response to the user or master agent.")));
+		case "maven" -> buildMavenArgumentsSchema();
 		default -> null;
 		};
 	}
@@ -108,7 +117,7 @@ public class ToolChoiceSchema {
 			return false;
 		}
 		return switch (toolName) {
-		case "read", "bash", "run", "edit", "write", "done" -> true;
+		case "read", "bash", "run", "edit", "write", "maven", "done" -> true;
 		case "subtask" -> includeSubtask;
 		default -> false;
 		};
@@ -123,7 +132,8 @@ public class ToolChoiceSchema {
 				.put("bash")
 				.put("run")
 				.put("edit")
-				.put("write");
+				.put("write")
+				.put("maven");
 		if (includeSubtask) {
 			toolNames.put("subtask");
 		}
@@ -158,7 +168,158 @@ public class ToolChoiceSchema {
 				.put("description", description);
 	}
 
+	private static JSONObject integerProperty(String description) {
+		return new JSONObject()
+				.put("type", "integer")
+				.put("minimum", 1)
+				.put("description", description);
+	}
+
 	private static JSONObject object() {
 		return new JSONObject().put("type", "object");
+	}
+
+	private static JSONObject buildMavenArgumentsSchema() {
+		JSONObject dependency = mavenDependencySchema();
+		JSONObject plugin = mavenPluginSchema();
+
+		JSONObject properties = mavenCommonProperties(dependency, plugin);
+		properties.put("action", new JSONObject()
+				.put("type", "string")
+				.put("enum", new JSONArray()
+						.put("init")
+						.put("info")
+						.put("configure")
+						.put("compile")
+						.put("test")
+						.put("package")
+						.put("goal"))
+				.put("description",
+						"Required. Choose the action from the selection step's thought/plan. "
+								+ "Use init to create a project, configure to change pom.xml, "
+								+ "compile/test/package for builds, goal for custom Maven goals, info only to inspect the current pom."));
+		properties.put("group_id", stringProperty(
+				"For init/configure. Maven groupId, e.g. com.elowbe. Required for init unless inferred by the tool."));
+		properties.put("artifact_id", stringProperty(
+				"For init/configure. Maven artifactId slug, e.g. lwjgl-cube. Required for init unless inferred by the tool."));
+		properties.put("goals", new JSONObject()
+				.put("type", "array")
+				.put("items", new JSONObject().put("type", "string"))
+				.put("description", "For goal: Maven goals/phases, e.g. [\"clean\", \"verify\"] or [\"javafx:run\"]."));
+		properties.put("goal", stringProperty("For goal: single Maven goal/phase when goals array is omitted."));
+		properties.put("quiet", new JSONObject()
+				.put("type", "boolean")
+				.put("description", "For compile/test/package/goal. Default true (uses mvn -q)."));
+		properties.put("skip_tests", new JSONObject()
+				.put("type", "boolean")
+				.put("description", "For compile/test/package/goal. Adds -DskipTests when true."));
+		properties.put("args", stringProperty("Extra Maven CLI args, e.g. \"-DskipTests -X\"."));
+		properties.put("timeout_seconds", new JSONObject()
+				.put("type", "number")
+				.put("minimum", 0)
+				.put("description", "Seconds before Maven is killed. Default 300. 0 means no timeout."));
+
+		return argumentsSchema(new JSONArray().put("action"), properties);
+	}
+
+	private static JSONObject mavenCommonProperties(JSONObject dependency, JSONObject plugin) {
+		JSONObject properties = new JSONObject()
+				.put("action", new JSONObject().put("type", "string"))
+				.put("version", stringProperty("Project version for init/configure."))
+				.put("java_version", stringProperty("Java version for init, default 17."))
+				.put("name", stringProperty("Project display name for init/configure."))
+				.put("description", stringProperty("Project description for init/configure."))
+				.put("packaging", stringProperty("Project packaging for init/configure, default jar."))
+				.put("properties", new JSONObject()
+						.put("type", "object")
+						.put("additionalProperties", new JSONObject().put("type", "string"))
+						.put("description", "For configure: property name to value map."))
+				.put("add_dependencies", new JSONObject()
+						.put("type", "array")
+						.put("items", dependency)
+						.put("description", "For configure: dependencies to add or update."))
+				.put("remove_dependencies", new JSONObject()
+						.put("type", "array")
+						.put("items", dependency)
+						.put("description", "For configure: dependencies to remove by group_id and artifact_id."))
+				.put("add_plugins", new JSONObject()
+						.put("type", "array")
+						.put("items", plugin)
+						.put("description", "For configure: plugins to add or update."))
+				.put("remove_plugins", new JSONObject()
+						.put("type", "array")
+						.put("items", plugin)
+						.put("description", "For configure: plugins to remove by group_id and artifact_id."));
+		return properties;
+	}
+
+	private static JSONObject mavenBuildProperties() {
+		return new JSONObject()
+				.put("action", new JSONObject().put("type", "string"))
+				.put("goals", new JSONObject()
+						.put("type", "array")
+						.put("items", new JSONObject().put("type", "string"))
+						.put("description", "For goal: Maven goals/phases, e.g. [\"clean\", \"verify\"] or [\"javafx:run\"]."))
+				.put("goal", stringProperty("For goal: single Maven goal/phase when goals array is omitted."))
+				.put("quiet", new JSONObject()
+						.put("type", "boolean")
+						.put("description", "For compile/test/package/goal. Default true (uses mvn -q)."))
+				.put("skip_tests", new JSONObject()
+						.put("type", "boolean")
+						.put("description", "For compile/test/package/goal. Adds -DskipTests when true."))
+				.put("args", stringProperty("Extra Maven CLI args, e.g. \"-DskipTests -X\"."))
+				.put("timeout_seconds", new JSONObject()
+						.put("type", "number")
+						.put("minimum", 0)
+						.put("description", "Seconds before Maven is killed. Default 300. 0 means no timeout."));
+	}
+
+	private static JSONObject mavenDependencySchema() {
+		JSONObject dependency = object();
+		dependency.put("additionalProperties", false);
+		dependency.put("properties", new JSONObject()
+				.put("group_id", stringProperty("Maven groupId."))
+				.put("artifact_id", stringProperty("Maven artifactId."))
+				.put("version", stringProperty("Dependency or plugin version."))
+				.put("scope", stringProperty("Optional dependency scope, e.g. compile, test, provided."))
+				.put("type", stringProperty("Optional dependency type, e.g. jar or pom."))
+				.put("classifier", stringProperty("Optional dependency classifier."))
+				.put("optional", new JSONObject()
+						.put("type", "boolean")
+						.put("description", "Whether the dependency is optional.")));
+		return dependency;
+	}
+
+	private static JSONObject mavenPluginSchema() {
+		JSONObject pluginExecution = object();
+		pluginExecution.put("additionalProperties", false);
+		pluginExecution.put("properties", new JSONObject()
+				.put("id", stringProperty("Optional execution id."))
+				.put("phase", stringProperty("Optional Maven phase, e.g. package."))
+				.put("goals", new JSONObject()
+						.put("type", "array")
+						.put("items", new JSONObject().put("type", "string"))
+						.put("description", "Goals for this execution, e.g. [\"shade\"]."))
+				.put("configuration", stringProperty("Optional inner XML placed under <configuration>.")));
+
+		JSONObject plugin = object();
+		plugin.put("additionalProperties", false);
+		plugin.put("properties", new JSONObject()
+				.put("group_id", stringProperty("Plugin groupId. Defaults to org.apache.maven.plugins."))
+				.put("artifact_id", stringProperty("Plugin artifactId."))
+				.put("version", stringProperty("Plugin version."))
+				.put("configuration", stringProperty("Optional inner XML placed under <configuration>."))
+				.put("executions", new JSONObject()
+						.put("type", "array")
+						.put("items", pluginExecution)
+						.put("description", "Optional plugin executions.")));
+		return plugin;
+	}
+
+	private static JSONObject requiredStringProperty(String description) {
+		return new JSONObject()
+				.put("type", "string")
+				.put("minLength", 1)
+				.put("description", description);
 	}
 }
