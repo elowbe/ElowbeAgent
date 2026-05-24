@@ -24,6 +24,7 @@ import com.elowbe.git.GitService;
 import com.elowbe.git.GitService.CommitMessage;
 import com.elowbe.git.GitService.FileChange;
 import com.elowbe.tools.AgentTools;
+import com.elowbe.tools.WebTool;
 import com.jinteractive.gui.Settings;
 import com.jinteractive.main.Colors;
 
@@ -61,6 +62,10 @@ public class ElowbeAgent extends JinCanvas {
 	private boolean thinkingEnabled = true;
 	/** When false, the subtask tool and delegation guard are disabled. */
 	private boolean subtasksEnabled = true;
+	/** When true, the web tool uses Vercel's agent-browser CLI instead of Selenium. */
+	private boolean agentBrowserWebEnabled = true;
+	/** Base command used to invoke Vercel's agent-browser CLI. */
+	private String agentBrowserCommand = "agent-browser --json";
 	InputWidget commandInput;
 	PrintWidget printWidget;
 	File directory;
@@ -137,6 +142,7 @@ public class ElowbeAgent extends JinCanvas {
 
 		loadSystemPrompt();
 		agentSettings = AgentSettings.load();
+		configureWebTool();
 		try {
 			directory = agentSettings.ensureProjectsDirectory();
 		} catch (IOException e) {
@@ -232,11 +238,12 @@ public class ElowbeAgent extends JinCanvas {
 				"- Java and Maven are the default stack unless the user explicitly requested another language, build tool, or framework.\n");
 		content.append(
 				"- ALWAYS use the maven tool (not bash mvn, not write/edit) for pom.xml and Maven builds.\n");
+		content.append(
+				"- Prefer the web tool over bash for web-based tasks: loading pages, following links, captcha-resistant web searches, browser-context API tests, and browser-observable HTTP behavior. Use bash for web work only when the web tool cannot express the task.\n");
+		content.append("- Web tool backend: ").append(agentBrowserWebEnabled
+				? "Vercel agent-browser CLI via `" + agentBrowserCommand + "`."
+				: "Selenium browser automation.").append('\n');
 		content.append("- Application type guidance: ").append(profile.frameworkGuidance).append('\n');
-		content.append(
-				"- HARD COMPLETION RULE: before finishing, ensure run.sh and run.bat exist in the current directory, ");
-		content.append(
-				"run the program with the script for the current OS, and include a run output analysis with key stdout/stderr findings.\n");
 		if (profile.mavenProjectRoot == null) {
 			content.append(
 					"- Maven project check: no pom.xml was found in the current directory or any parent directory.\n");
@@ -592,6 +599,7 @@ public class ElowbeAgent extends JinCanvas {
 
 				printWidget.print("<#green>");
 				printWidget.setColor(Colors.green);
+				configureWebTool();
 				AgentRunner.run(request, directory, token -> {
 					if (!subtaskActive) {
 						printWidget.setColor(Colors.green);
@@ -606,8 +614,8 @@ public class ElowbeAgent extends JinCanvas {
 						targetColor = Colors.randomColorFromSeed("" + Math.random() * 1000000L, .95f, 1f);
 						t = 0;
 					}
-					printWidget.setColor(subtaskActive ? Colors.darkblue : Colors.lightgray);
-					printWidget.print(thinking);
+//					printWidget.setColor(subtaskActive ? Colors.darkblue : Colors.lightgray);
+//					printWidget.print(thinking);
 				} : null, (name, args, result) -> logToolActivity(name, args, result), this::addAgentTokenUsage,
 						() -> agentCancelRequested.get() || Thread.currentThread().isInterrupted(), thinkingEnabled,
 						subtasksEnabled);
@@ -855,6 +863,30 @@ public class ElowbeAgent extends JinCanvas {
 		this.subtasksEnabled = subtasksEnabled;
 	}
 
+	public boolean isAgentBrowserWebEnabled() {
+		return agentBrowserWebEnabled;
+	}
+
+	public void setAgentBrowserWebEnabled(boolean agentBrowserWebEnabled) {
+		this.agentBrowserWebEnabled = agentBrowserWebEnabled;
+		configureWebTool();
+	}
+
+	public String getAgentBrowserCommand() {
+		return agentBrowserCommand;
+	}
+
+	public void setAgentBrowserCommand(String agentBrowserCommand) {
+		if (agentBrowserCommand != null && !agentBrowserCommand.isBlank()) {
+			this.agentBrowserCommand = agentBrowserCommand.trim();
+			configureWebTool();
+		}
+	}
+
+	private void configureWebTool() {
+		WebTool.configureAgentBrowserCli(agentBrowserWebEnabled, agentBrowserCommand);
+	}
+
 	private void handleSubtasksCommand(Command cmd) {
 		if (cmd.has("on") || cmd.has("enable")) {
 			setSubtasksEnabled(true);
@@ -874,6 +906,64 @@ public class ElowbeAgent extends JinCanvas {
 		printWidget.println("  /subtasks -on              enable worker subtask delegation");
 		printWidget.println("  /subtasks -off             disable worker subtask delegation");
 		printWidget.println("  /subtasks -show            show current setting");
+	}
+
+	private void handleWebCommand(Command cmd) {
+		if (cmd.has("agent-browser")) {
+			String value = cmd.get("agent-browser");
+			if (value == null || value.isBlank() || isOnValue(value)) {
+				setAgentBrowserWebEnabled(true);
+				printWidget.println("Web tool backend set to agent-browser CLI.");
+			} else if (isOffValue(value)) {
+				setAgentBrowserWebEnabled(false);
+				printWidget.println("Web tool backend set to Selenium.");
+			} else {
+				printWidget.println("Error: -agent-browser expects on or off");
+			}
+			return;
+		}
+		if (cmd.has("selenium")) {
+			setAgentBrowserWebEnabled(false);
+			printWidget.println("Web tool backend set to Selenium.");
+			return;
+		}
+		if (cmd.has("command")) {
+			String value = cmd.get("command");
+			if (value == null || value.isBlank()) {
+				printWidget.println("Error: -command requires the agent-browser base command");
+				return;
+			}
+			setAgentBrowserCommand(value);
+			printWidget.println("Agent-browser command set to: " + agentBrowserCommand);
+			return;
+		}
+		if (cmd.has("show")) {
+			printWebStatus();
+			return;
+		}
+		printWebStatus();
+		printWidget.println("  /web -show                                      show current web tool settings");
+		printWidget.println("  /web -agent-browser on                         use Vercel agent-browser CLI");
+		printWidget.println("  /web -agent-browser off                        use Selenium");
+		printWidget.println("  /web -selenium                                 same as -agent-browser off");
+		printWidget.println("  /web -command \"agent-browser --json\"           set agent-browser base command");
+	}
+
+	private void printWebStatus() {
+		printWidget.println("Web tool backend: " + (agentBrowserWebEnabled ? "agent-browser CLI" : "Selenium"));
+		printWidget.println("Agent-browser command: " + agentBrowserCommand);
+	}
+
+	private static boolean isOnValue(String value) {
+		String normalized = value == null ? "" : value.trim().toLowerCase(Locale.ROOT);
+		return normalized.equals("on") || normalized.equals("true") || normalized.equals("enable")
+				|| normalized.equals("enabled") || normalized.equals("yes");
+	}
+
+	private static boolean isOffValue(String value) {
+		String normalized = value == null ? "" : value.trim().toLowerCase(Locale.ROOT);
+		return normalized.equals("off") || normalized.equals("false") || normalized.equals("disable")
+				|| normalized.equals("disabled") || normalized.equals("no");
 	}
 
 	public int getAgentContextLength() {
@@ -1002,6 +1092,7 @@ public class ElowbeAgent extends JinCanvas {
 		case "model" -> openModelPicker();
 		case "thinking" -> handleThinkingCommand(cmd);
 		case "subtasks" -> handleSubtasksCommand(cmd);
+		case "web" -> handleWebCommand(cmd);
 		case "context" -> handleContextCommand(cmd);
 		case "output" -> handleOutputCommand(cmd);
 		case "system" -> handleSystemCommand(cmd);
@@ -1736,6 +1827,7 @@ public class ElowbeAgent extends JinCanvas {
 			printWidget.println("/model             choose LLM model (Ollama, LM Studio, Claude)");
 			printWidget.println("/thinking          enable or disable thinking/reasoning output");
 			printWidget.println("/subtasks          enable or disable worker subtask delegation");
+			printWidget.println("/web               configure web tool backend (Selenium or agent-browser)");
 			printWidget.println("/context           set LLM context window size");
 			printWidget.println("/output            set max tokens generated per LLM response");
 			printWidget.println("/system            system prompt (" + SYSTEM_PROMPT_FILE.getPath() + ")");
@@ -1758,6 +1850,7 @@ public class ElowbeAgent extends JinCanvas {
 		printWidget.println("  /model");
 		printWidget.println("  /thinking -show");
 		printWidget.println("  /subtasks -show");
+		printWidget.println("  /web -show");
 		printWidget.println("  /context -show");
 		printWidget.println("  /output -show");
 		printWidget.println("  /system -show");

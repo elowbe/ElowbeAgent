@@ -99,6 +99,7 @@ public class AgentTools {
 			case "edit" -> edit(arguments, workingDirectory);
 			case "write" -> write(arguments, workingDirectory);
 			case "maven" -> MavenTool.execute(arguments, workingDirectory, cancelRequested);
+			case "web" -> WebTool.execute(arguments, workingDirectory, cancelRequested);
 			case "subtask" -> subtask(arguments, workingDirectory, cancelRequested, subtaskDepth);
 			case "done" -> done(arguments);
 			default -> ToolResult.output("Tool error: unknown tool: " + name);

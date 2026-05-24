@@ -16,6 +16,7 @@ import org.json.JSONObject;
 import com.elowbe.tools.AgentTools;
 import com.elowbe.tools.ToolChoiceSchema;
 import com.elowbe.tools.ToolResult;
+import com.elowbe.tools.WebTool;
 import com.elowbe.tools.maven.MavenTool;
 
 import lib.console.util.OllamaAPI;
@@ -78,7 +79,7 @@ public class AgentRunner {
 
 			Available tools (two-step: pick tool name in tool_call, then fill arguments):
 			read: {"path":"relative/or/absolute/file"} — output uses LINE|content format
-			bash: {"command":"shell command","timeout_seconds":120} — NOT for Maven or pom.xml
+			bash: {"command":"shell command","timeout_seconds":120} — NOT for Maven, pom.xml, or browser/web tasks that the web tool can perform
 			run: {"command":"optional override; defaults to run.sh/run.bat for this OS"}
 			edit: {"path":"file","start_line":10,"end_line":12,"new":"replacement text"}
 			write: {"path":"file","content":"new file contents"} — NOT for pom.xml
@@ -89,6 +90,12 @@ public class AgentRunner {
 			  compile/test/package: quiet, skip_tests, args, timeout_seconds optional
 			  goal: goals array or goal string required; quiet, skip_tests, args, timeout_seconds optional
 			  Never use bash mvn when maven can do the job.
+			web: {"action":"open|follow|search|api","url":"https://...","query":"search terms"} — configured browser tool
+			  Prefer web over bash for web-based tasks.
+			  open: load a page and return title, text excerpt, and links
+			  follow: load url, then follow link_url, link_text, or link_index
+			  search: query required; searches the web and returns results/links
+			  api: url required; method, headers, body optional; tests HTTP APIs from a browser context
 			done: {"response":"final result for the master agent"}
 
 			HARD RULE — one action, then done:
@@ -327,11 +334,6 @@ public class AgentRunner {
 				if (completedByTool) {
 					String response = pickFinalResponse(step, toolFinalResponse);
 					if (subtaskDepth == 0) {
-						String validationError = guard.validateFinalResponse(response);
-						if (validationError != null) {
-							appendUserInstruction(messages, validationError);
-							continue;
-						}
 						response = guard.enrichFinalResponse(response);
 					}
 					if (!response.isBlank()) {
@@ -345,11 +347,6 @@ public class AgentRunner {
 			if (step.optBoolean("complete", false) || "final".equals(step.optString("step"))) {
 				String response = pickFinalResponse(step, "");
 				if (subtaskDepth == 0) {
-					String validationError = guard.validateFinalResponse(response);
-					if (validationError != null) {
-						appendUserInstruction(messages, validationError);
-						continue;
-					}
 					response = guard.enrichFinalResponse(response);
 				}
 				emitFinalResponse(response, tokenSink, subtaskDepth);
@@ -477,6 +474,7 @@ public class AgentRunner {
 			yield cmd.isBlank() ? "→ run (project script)" : "→ run: " + truncateInline(cmd, 100);
 		}
 		case "maven" -> MavenTool.describeAction(args);
+		case "web" -> WebTool.describeAction(args);
 		case "done" -> "→ done";
 		case "subtask" -> "→ subtask: " + truncateInline(first(args, "task", "instruction", "goal"), 120);
 		case "subtask.start" -> "── subagent: " + truncateInline(args.optString("task", "?"), 120) + " ──";
@@ -515,6 +513,7 @@ public class AgentRunner {
 		case "write", "edit" -> "  ✓ " + truncateInline(firstNonBlankLine(result), 160);
 		case "bash", "run" -> formatCommandOutputSummary(result);
 		case "maven" -> MavenTool.describeResultSummary(result);
+		case "web" -> WebTool.describeResultSummary(result);
 		case "subtask" -> formatSubtaskSummary(result);
 		default -> formatGenericSummary(result);
 		};
@@ -531,6 +530,7 @@ public class AgentRunner {
 		case "write" -> line.startsWith("write:") && !line.startsWith("write: wrote");
 		case "bash" -> line.startsWith("bash:") && !line.equals("bash: cancelled");
 		case "maven" -> line.startsWith("maven:") || (line.startsWith("maven ") && line.contains("(exit ") && !line.contains("(exit 0)"));
+		case "web" -> line.startsWith("web:") || line.startsWith("Tool error:");
 		case "run" -> line.startsWith("run:") && line.contains("error");
 		default -> false;
 		};
@@ -1222,10 +1222,7 @@ public class AgentRunner {
 		if (response.isBlank() || tokenSink == null) {
 			return;
 		}
-		// Main agent output is already streamed token-by-token; subtasks collect a summary.
-		if (subtaskDepth > 0) {
-			tokenSink.accept(response);
-		}
+		tokenSink.accept(subtaskDepth > 0 ? response : "\n" + response);
 	}
 
 	private static void emitStreamingUsage(JSONObject usage, UsageSink usageSink) {
@@ -1303,7 +1300,7 @@ public class AgentRunner {
 			}
 			runSh.toFile().setExecutable(true, false);
 		} catch (IOException ignored) {
-			// Non-fatal: completion guard still requires script execution evidence.
+			// Non-fatal: run scripts are a convenience for manual or requested verification.
 		}
 	}
 
@@ -1326,21 +1323,6 @@ public class AgentRunner {
 				runScriptExecuted = true;
 				lastRunOutput = output == null ? "" : output;
 			}
-		}
-
-		private String validateFinalResponse(String response) {
-			if (runScriptExecuted) {
-				return null;
-			}
-			return """
-					HARD RULE NOT SATISFIED:
-					Do not finish yet.
-					1) Ensure run.sh and run.bat exist in the current directory.
-					2) Run the program via script:
-					   - preferred: run tool with no arguments
-					   - fallback: macOS/Linux ./run.sh (or bash run.sh), Windows cmd /c run.bat
-					3) Then call done again.
-					""";
 		}
 
 		private String enrichFinalResponse(String response) {

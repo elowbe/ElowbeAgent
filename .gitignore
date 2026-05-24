@@ -5,3 +5,5 @@
 /agenttest
 /src/.cursor
 SKILL.md
+*.class
+/target

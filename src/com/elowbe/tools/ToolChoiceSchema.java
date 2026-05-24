@@ -89,7 +89,8 @@ public class ToolChoiceSchema {
 		case "bash" -> argumentsSchema(
 				new JSONArray().put("command"),
 				new JSONObject()
-						.put("command", stringProperty("Shell command to run in the project directory."))
+						.put("command", stringProperty(
+								"Shell command to run in the project directory. Do not use bash for browser/web tasks that the web tool can perform."))
 						.put("timeout_seconds", new JSONObject()
 								.put("type", "number")
 								.put("minimum", 0)
@@ -100,6 +101,7 @@ public class ToolChoiceSchema {
 				new JSONArray(),
 				new JSONObject().put("command", stringProperty(
 						"Optional shell command override. Omit or use empty string to run run.sh/run.bat.")));
+		case "web" -> buildWebArgumentsSchema();
 		case "subtask" -> argumentsSchema(
 				new JSONArray().put("task"),
 				new JSONObject()
@@ -120,7 +122,7 @@ public class ToolChoiceSchema {
 			return false;
 		}
 		return switch (toolName) {
-		case "read", "bash", "run", "edit", "write", "maven", "done" -> true;
+		case "read", "bash", "run", "edit", "write", "maven", "web", "done" -> true;
 		case "subtask" -> includeSubtask;
 		default -> false;
 		};
@@ -136,7 +138,8 @@ public class ToolChoiceSchema {
 				.put("run")
 				.put("edit")
 				.put("write")
-				.put("maven");
+				.put("maven")
+				.put("web");
 		if (includeSubtask) {
 			toolNames.put("subtask");
 		}
@@ -180,6 +183,43 @@ public class ToolChoiceSchema {
 
 	private static JSONObject object() {
 		return new JSONObject().put("type", "object");
+	}
+
+	private static JSONObject buildWebArgumentsSchema() {
+		JSONObject properties = new JSONObject();
+		properties.put("action", new JSONObject()
+				.put("type", "string")
+				.put("enum", new JSONArray()
+						.put("open")
+						.put("follow")
+						.put("search")
+						.put("api"))
+				.put("description",
+						"Use open to load a page and extract text/links, follow to load a URL then follow a link, "
+								+ "search to search the web with fallback providers, api to test an HTTP API from a browser context."));
+		properties.put("url", stringProperty("Page URL or API endpoint. Required for open/follow/api."));
+		properties.put("query", stringProperty("Search query. Required for search."));
+		properties.put("link_url", stringProperty("For follow: exact URL/href to follow after loading url."));
+		properties.put("link_text", stringProperty("For follow: click the first link containing this visible text."));
+		properties.put("link_index", new JSONObject()
+				.put("type", "integer")
+				.put("minimum", 0)
+				.put("description", "For follow: zero-based index into the page's discovered links."));
+		properties.put("method", stringProperty("For api: HTTP method. Defaults to GET."));
+		properties.put("headers", new JSONObject()
+				.put("type", "object")
+				.put("additionalProperties", new JSONObject().put("type", "string"))
+				.put("description", "For api: request headers."));
+		properties.put("body", stringProperty("For api: request body string."));
+		properties.put("max_links", new JSONObject()
+				.put("type", "integer")
+				.put("minimum", 0)
+				.put("description", "Maximum number of links to return. Default 30."));
+		properties.put("timeout_seconds", new JSONObject()
+				.put("type", "number")
+				.put("minimum", 1)
+				.put("description", "Browser page-load and script timeout in seconds. Default 30."));
+		return argumentsSchema(new JSONArray().put("action"), properties);
 	}
 
 	private static JSONObject buildMavenArgumentsSchema() {
