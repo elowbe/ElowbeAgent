@@ -40,6 +40,11 @@ public final class SkillSelector {
 
 	public static SkillSelectionResult select(String instruction, List<Skill> candidates, File runDirectory,
 			BooleanSupplier cancelRequested, UsageSink usageSink) throws IOException {
+		return select(instruction, candidates, runDirectory, cancelRequested, usageSink, true);
+	}
+
+	public static SkillSelectionResult select(String instruction, List<Skill> candidates, File runDirectory,
+			BooleanSupplier cancelRequested, UsageSink usageSink, boolean thinkingEnabled) throws IOException {
 		if (candidates == null || candidates.isEmpty()) {
 			return new SkillSelectionResult(List.of(), null, "no skill candidates on disk");
 		}
@@ -58,7 +63,7 @@ public final class SkillSelector {
 			usageSink.accept(assistant.getJSONObject("usage"));
 		}
 
-		String raw = extractModelText(assistant);
+		String raw = extractModelText(assistant, thinkingEnabled);
 		List<String> ids = parseSelectedIds(raw);
 		List<Skill> selected = resolveSelected(ids, candidates, runDirectory);
 		String note = buildNote(candidates, selected, ids, raw);
@@ -89,11 +94,14 @@ public final class SkillSelector {
 	}
 
 	/** Qwen and other thinking models may put JSON in {@code thinking} instead of {@code content}. */
-	private static String extractModelText(JSONObject assistant) {
+	private static String extractModelText(JSONObject assistant, boolean thinkingEnabled) {
 		if (assistant == null) {
 			return "";
 		}
 		String content = assistant.optString("content", "").trim();
+		if (!thinkingEnabled) {
+			return content;
+		}
 		String thinking = assistant.optString("thinking", "").trim();
 		if (parseJson(content) != null) {
 			return content;

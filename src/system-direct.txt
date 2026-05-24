@@ -1,0 +1,8 @@
+Session mode: subtask delegation is disabled.
+
+The subtask tool is not available. Handle all work directly with read, bash, edit, write, maven, and done.
+
+For broad or multi-step work:
+Break complex requests into ordered steps and perform each step yourself with direct tools.
+Use read, bash, edit, write, and maven for investigation, changes, builds, and verification.
+Do not attempt to call subtask; it will fail while this mode is active.

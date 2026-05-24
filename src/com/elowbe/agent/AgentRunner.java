@@ -22,7 +22,9 @@ import lib.console.util.OllamaAPI;
 
 public class AgentRunner {
 	private static final int MAX_TURNS = 400;
+	private static final int MAX_SCHEMA_RETRIES = 3;
 	private static final int MAX_SUBTASK_DEPTH = 1;
+	private static final int MAX_SUBTASK_WORKER_TOOLS = 1;
 	private static final int MAX_SUBTASK_RESULT_CHARS = 40_000;
 	private static final BooleanSupplier NEVER_CANCEL = () -> false;
 	private static final String RUN_SCRIPT_UNIX = """
@@ -66,8 +68,8 @@ public class AgentRunner {
 			""";
 	private static final String SUBTASK_SYSTEM_PROMPT = """
 			You are a focused worker agent for a larger coding task.
-			Complete only the assigned subtask using the available tools.
-			Do not broaden the task, do not ask for new work, and do not delegate subtasks.
+			Perform exactly one assigned action, then terminate. Do not broaden the task,
+			do not chain extra steps, do not ask for new work, and do not delegate subtasks.
 			Return a concise result that includes what you changed or learned, any files touched,
 			and anything the master agent must know before continuing.
 
@@ -89,23 +91,11 @@ public class AgentRunner {
 			  Never use bash mvn when maven can do the job.
 			done: {"response":"final result for the master agent"}
 
-			You must call exactly one tool per step. When you know the tool, use
-			step=execute_tool with tool_call.name in the same response—do not replan first.
-			After each tool result, the next turn must set tool_call.name (next tool or done).
-			Arguments are collected automatically in a follow-up request with a tool-specific schema.
-			That follow-up receives the thought and plan from your tool selection step — arguments must follow that intent.
-			You must call at least one non-done tool before done so the master agent has
-			evidence that this worker actually ran. For code tasks, read relevant files,
-			run an inspection command, edit files, write files, or run a verification command.
-			If you cannot use a tool, call done with a clear explanation that no tool evidence
-			was produced.
-
-			HARD RULE:
-			Before calling done, run the project via the generated run script in the current directory:
-			- preferred: run tool with no arguments
-			- fallback: macOS/Linux ./run.sh (or bash run.sh), Windows cmd /c run.bat
-			Then include a run output analysis in your final response with:
-			- key stdout/stderr findings
+			HARD RULE — one action, then done:
+			1) Call exactly one non-done tool that performs the assigned action.
+			2) Call done with a summary of the tool result.
+			Do not call a second non-done tool. Verification, follow-up edits, and integration
+			are the master agent's job. If you cannot use a tool, call done with a clear explanation.
 			""";
 
 	@FunctionalInterface
@@ -144,7 +134,21 @@ public class AgentRunner {
 	public static void run(JSONArray messages, File workingDirectory, TokenSink tokenSink,
 			ThinkingSink thinkingSink, ToolSink toolSink, UsageSink usageSink, BooleanSupplier cancelRequested)
 			throws IOException {
-		run(messages, workingDirectory, tokenSink, thinkingSink, toolSink, usageSink, cancelRequested, 0);
+		run(messages, workingDirectory, tokenSink, thinkingSink, toolSink, usageSink, cancelRequested, true, false);
+	}
+
+	public static void run(JSONArray messages, File workingDirectory, TokenSink tokenSink,
+			ThinkingSink thinkingSink, ToolSink toolSink, UsageSink usageSink, BooleanSupplier cancelRequested,
+			boolean thinkingEnabled) throws IOException {
+		run(messages, workingDirectory, tokenSink, thinkingSink, toolSink, usageSink, cancelRequested,
+				thinkingEnabled, false);
+	}
+
+	public static void run(JSONArray messages, File workingDirectory, TokenSink tokenSink,
+			ThinkingSink thinkingSink, ToolSink toolSink, UsageSink usageSink, BooleanSupplier cancelRequested,
+			boolean thinkingEnabled, boolean subtasksEnabled) throws IOException {
+		run(messages, workingDirectory, tokenSink, thinkingSink, toolSink, usageSink, cancelRequested, 0,
+				thinkingEnabled, subtasksEnabled);
 	}
 
 	public static String runSubtask(String task, String context, File workingDirectory, BooleanSupplier cancelRequested)
@@ -169,21 +173,21 @@ public class AgentRunner {
 		if (context != null && !context.isBlank()) {
 			userContent.append("\n\nContext from master agent:\n").append(context.trim());
 		}
-		userContent.append("\n\nDo this one thing and finish with the done tool.");
+		userContent.append("\n\nRun exactly one action tool for this assignment, then call done and stop.");
 		messages.put(new JSONObject()
 				.put("role", "user")
 				.put("content", userContent.toString()));
 
 		StringBuilder result = new StringBuilder();
 		run(messages, workingDirectory, result::append, thinkingSink, toolSink, usageSink, cancelRequested,
-				MAX_SUBTASK_DEPTH);
+				MAX_SUBTASK_DEPTH, OllamaAPI.thinkingEnabled, true);
 		String text = result.toString().trim();
 		return text.isBlank() ? "Subtask finished without a final response." : text;
 	}
 
 	private static void run(JSONArray messages, File workingDirectory, TokenSink tokenSink,
 			ThinkingSink thinkingSink, ToolSink toolSink, UsageSink usageSink, BooleanSupplier cancelRequested,
-			int subtaskDepth)
+			int subtaskDepth, boolean thinkingEnabled, boolean subtasksEnabled)
 			throws IOException {
 		if (cancelRequested == null) {
 			cancelRequested = NEVER_CANCEL;
@@ -191,9 +195,13 @@ public class AgentRunner {
 		if (subtaskDepth == 0) {
 			ensureRunScripts(workingDirectory);
 		}
-		JSONObject format = ToolChoiceSchema.build(subtaskDepth < MAX_SUBTASK_DEPTH);
+		boolean includeSubtask = subtasksEnabled && subtaskDepth < MAX_SUBTASK_DEPTH;
+		JSONObject format = ToolChoiceSchema.build(includeSubtask);
 		CompletionGuard guard = new CompletionGuard();
+		DelegationGuard delegationGuard = subtaskDepth == 0 && subtasksEnabled ? new DelegationGuard(messages) : null;
+		SubtaskWorkerGuard subtaskWorkerGuard = subtaskDepth > 0 ? new SubtaskWorkerGuard() : null;
 		StepLoopState loopState = new StepLoopState();
+		int stepRetryStreak = 0;
 
 		for (int turn = 0; turn < MAX_TURNS; turn++) {
 			throwIfCancelled(cancelRequested);
@@ -236,14 +244,21 @@ public class AgentRunner {
 			emitUsage(assistantMessage, usageSink);
 			assistantMessage.remove("usage");
 			throwIfCancelled(cancelRequested);
-			messages.put(assistantMessage);
 
-			JSONObject step = parseStep(assistantMessage.optString("content", ""));
-			if (step == null) {
-				appendUserInstruction(messages,
-						"Your last response did not match the required JSON schema. Return one valid JSON object only.");
+			String rawStepContent = extractAssistantText(assistantMessage, thinkingEnabled);
+			JSONObject step = parseStep(rawStepContent);
+			String stepShapeError = validateStepShape(step, rawStepContent, assistantMessage, thinkingEnabled);
+			if (stepShapeError != null) {
+				stepRetryStreak++;
+				logSchemaRetry("agent step", stepRetryStreak, MAX_SCHEMA_RETRIES, stepShapeError, rawStepContent);
+				if (stepRetryStreak >= MAX_SCHEMA_RETRIES) {
+					throwSchemaRetryExhausted("agent step JSON", MAX_SCHEMA_RETRIES);
+				}
 				continue;
 			}
+			stepRetryStreak = 0;
+			normalizeAssistantMessageContent(assistantMessage, thinkingEnabled);
+			messages.put(assistantMessage);
 
 			emitStepThinking(step, thinkingSink, loopState);
 
@@ -261,29 +276,48 @@ public class AgentRunner {
 				}
 
 				String name = call.optString("name", "");
-				boolean includeSubtask = subtaskDepth < MAX_SUBTASK_DEPTH;
 				if (!ToolChoiceSchema.isKnownTool(name, includeSubtask)) {
 					appendUserInstruction(messages,
 							"Unknown tool \"" + name + "\". Use tool_call.name with a supported tool only.");
 					continue;
 				}
+				if (delegationGuard != null) {
+					String delegationInstruction = delegationGuard.validateToolChoice(name, messages);
+					if (delegationInstruction != null) {
+						appendUserInstruction(messages, delegationInstruction);
+						continue;
+					}
+				}
+				if (subtaskWorkerGuard != null) {
+					String workerInstruction = subtaskWorkerGuard.validateToolChoice(name);
+					if (workerInstruction != null) {
+						appendUserInstruction(messages, workerInstruction);
+						continue;
+					}
+				}
 				JSONObject arguments = resolveToolArguments(name, step, messages, tokenSink, thinkingSink, usageSink,
-						cancelRequested, subtaskDepth);
+						cancelRequested, subtaskDepth, thinkingEnabled);
 				if (arguments == null) {
-					appendUserInstruction(messages,
-							"Could not obtain valid arguments for tool \"" + name
-									+ "\". Try the same tool again.");
 					continue;
 				}
 				throwIfCancelled(cancelRequested);
 				ToolResult result = executeTool(name, arguments, workingDirectory, cancelRequested, subtaskDepth,
-						thinkingSink, toolSink, usageSink);
+						subtasksEnabled, thinkingSink, toolSink, usageSink);
 				throwIfCancelled(cancelRequested);
 				if (toolSink != null) {
 					toolSink.accept(name, arguments, result.getOutput());
 				}
 				appendToolResult(messages, name, arguments, result.getOutput());
 				guard.observe(name, arguments, result.getOutput());
+				if (delegationGuard != null) {
+					delegationGuard.observe(name, result.getOutput(), messages);
+				}
+				if (subtaskWorkerGuard != null) {
+					subtaskWorkerGuard.observe(name);
+					if (subtaskWorkerGuard.shouldFinishAfterTool(name)) {
+						appendUserInstruction(messages, subtaskWorkerGuard.finishInstruction());
+					}
+				}
 				loopState.onToolExecuted(result.isComplete());
 
 				if (result.isComplete()) {
@@ -332,11 +366,14 @@ public class AgentRunner {
 	}
 
 	private static ToolResult executeTool(String name, JSONObject arguments, File workingDirectory,
-			BooleanSupplier cancelRequested, int subtaskDepth, ThinkingSink thinkingSink, ToolSink toolSink,
-			UsageSink usageSink)
+			BooleanSupplier cancelRequested, int subtaskDepth, boolean subtasksEnabled, ThinkingSink thinkingSink,
+			ToolSink toolSink, UsageSink usageSink)
 			throws IOException {
 		if (!"subtask".equals(name)) {
 			return AgentTools.execute(name, arguments, workingDirectory, cancelRequested, subtaskDepth);
+		}
+		if (!subtasksEnabled) {
+			return ToolResult.output("subtask: subtasks are disabled; finish this task directly with other tools");
 		}
 		if (subtaskDepth >= MAX_SUBTASK_DEPTH) {
 			return ToolResult.output("subtask: nested subtasks are disabled; finish this worker task directly");
@@ -649,63 +686,78 @@ public class AgentRunner {
 	 */
 	private static JSONObject resolveToolArguments(String toolName, JSONObject selectionStep, JSONArray messages,
 			TokenSink tokenSink, ThinkingSink thinkingSink, UsageSink usageSink, BooleanSupplier cancelRequested,
-			int subtaskDepth) throws IOException {
+			int subtaskDepth, boolean thinkingEnabled) throws IOException {
 		JSONObject format = ToolChoiceSchema.buildToolArgumentsSchema(toolName);
 		if (format == null) {
 			return null;
 		}
 
+		int messageCountBeforeArguments = messages.length();
 		appendUserInstruction(messages, toolArgumentPrompt(toolName, selectionStep));
 
-		JSONObject assistantMessage = OllamaAPI.streamChatCompletion(messages, null, format,
-				new OllamaAPI.ChatStreamListener() {
-					@Override
-					public void onToken(String token) {
-						if (token == null || token.isEmpty()) {
-							return;
-						}
-						if (subtaskDepth > 0) {
-							if (thinkingSink != null) {
-								thinkingSink.accept(prefixSubtaskOutput(token));
+		for (int attempt = 1; attempt <= MAX_SCHEMA_RETRIES; attempt++) {
+			JSONObject assistantMessage = OllamaAPI.streamChatCompletion(messages, null, format,
+					new OllamaAPI.ChatStreamListener() {
+						@Override
+						public void onToken(String token) {
+							if (token == null || token.isEmpty()) {
+								return;
 							}
-						} else if (thinkingSink != null) {
-							thinkingSink.accept(token);
-						} else if (tokenSink != null) {
-							tokenSink.accept(token);
+							if (subtaskDepth > 0) {
+								if (thinkingSink != null) {
+									thinkingSink.accept(prefixSubtaskOutput(token));
+								}
+							} else if (thinkingSink != null) {
+								thinkingSink.accept(token);
+							} else if (tokenSink != null) {
+								tokenSink.accept(token);
+							}
 						}
-					}
 
-					@Override
-					public void onThinking(String token) {
-						if (token == null || token.isEmpty() || thinkingSink == null) {
-							return;
+						@Override
+						public void onThinking(String token) {
+							if (token == null || token.isEmpty() || thinkingSink == null) {
+								return;
+							}
+							if (subtaskDepth > 0) {
+								thinkingSink.accept(prefixSubtaskOutput(token));
+							} else {
+								thinkingSink.accept(token);
+							}
 						}
-						if (subtaskDepth > 0) {
-							thinkingSink.accept(prefixSubtaskOutput(token));
-						} else {
-							thinkingSink.accept(token);
+
+						@Override
+						public void onUsage(JSONObject usage) {
+							emitStreamingUsage(usage, usageSink);
 						}
-					}
+					}, null, cancelRequested);
+			emitUsage(assistantMessage, usageSink);
+			assistantMessage.remove("usage");
+			throwIfCancelled(cancelRequested);
 
-					@Override
-					public void onUsage(JSONObject usage) {
-						emitStreamingUsage(usage, usageSink);
-					}
-				}, null, cancelRequested);
-		emitUsage(assistantMessage, usageSink);
-		assistantMessage.remove("usage");
-		throwIfCancelled(cancelRequested);
-		messages.put(assistantMessage);
-
-		JSONObject parsed = parseStep(assistantMessage.optString("content", ""));
-		if (parsed == null) {
-			return null;
+			String rawArgumentContent = extractAssistantText(assistantMessage, thinkingEnabled);
+			JSONObject parsed = parseStep(rawArgumentContent);
+			String argumentError = validateToolArgumentsShape(toolName, parsed, rawArgumentContent, assistantMessage,
+					thinkingEnabled);
+			if (argumentError != null) {
+				logSchemaRetry("tool arguments for \"" + toolName + "\"", attempt, MAX_SCHEMA_RETRIES,
+						argumentError, rawArgumentContent);
+				if (attempt >= MAX_SCHEMA_RETRIES) {
+					removeMessagesFrom(messages, messageCountBeforeArguments);
+					return throwSchemaRetryExhausted("tool arguments for \"" + toolName + "\"", MAX_SCHEMA_RETRIES);
+				}
+				continue;
+			}
+			normalizeAssistantMessageContent(assistantMessage, thinkingEnabled);
+			messages.put(assistantMessage);
+			JSONObject wrapped = parsed.optJSONObject("arguments");
+			if (wrapped != null) {
+				return normalizeToolArguments(toolName, selectionStep, wrapped);
+			}
+			return normalizeToolArguments(toolName, selectionStep, parsed);
 		}
-		JSONObject wrapped = parsed.optJSONObject("arguments");
-		if (wrapped != null) {
-			return normalizeToolArguments(toolName, selectionStep, wrapped);
-		}
-		return normalizeToolArguments(toolName, selectionStep, parsed);
+		removeMessagesFrom(messages, messageCountBeforeArguments);
+		return throwSchemaRetryExhausted("tool arguments for \"" + toolName + "\"", MAX_SCHEMA_RETRIES);
 	}
 
 	private static JSONObject normalizeToolArguments(String toolName, JSONObject selectionStep, JSONObject arguments) {
@@ -799,6 +851,178 @@ public class AgentRunner {
 		}
 	}
 
+	private static void logSchemaRetry(String context, int attempt, int maxAttempts, String reason, String rawContent) {
+		String preview = truncateInline(rawContent == null ? "" : rawContent, 160);
+		System.out.println("[ElowbeAgent] Schema retry " + attempt + "/" + maxAttempts + " (" + context + "): "
+				+ reason + (preview.isBlank() ? "" : " | response: " + preview));
+	}
+
+	private static JSONObject throwSchemaRetryExhausted(String context, int maxAttempts) throws IOException {
+		throw new IOException("Agent error: LLM failed to return valid JSON for " + context + " after "
+				+ maxAttempts + " attempts");
+	}
+
+	private static void normalizeAssistantMessageContent(JSONObject assistantMessage, boolean thinkingEnabled) {
+		if (assistantMessage == null || !thinkingEnabled) {
+			return;
+		}
+		if (!assistantMessage.optString("content", "").isBlank()) {
+			return;
+		}
+		String thinking = assistantMessage.optString("thinking", "").trim();
+		if (!thinking.isBlank()) {
+			assistantMessage.put("content", thinking);
+		}
+	}
+
+	private static String extractAssistantText(JSONObject assistantMessage, boolean thinkingEnabled) {
+		if (assistantMessage == null) {
+			return "";
+		}
+		String content = assistantMessage.optString("content", "").trim();
+		if (!content.isBlank()) {
+			return content;
+		}
+		if (!thinkingEnabled) {
+			return "";
+		}
+		String thinking = assistantMessage.optString("thinking", "").trim();
+		if (!thinking.isBlank()) {
+			return thinking;
+		}
+		return "";
+	}
+
+	private static String describeAssistantMessageFields(JSONObject assistantMessage) {
+		if (assistantMessage == null) {
+			return "no assistant message";
+		}
+		int contentChars = assistantMessage.optString("content", "").length();
+		int thinkingChars = assistantMessage.optString("thinking", "").length();
+		return "content=" + contentChars + " chars, thinking=" + thinkingChars + " chars";
+	}
+
+	private static String validateStepShape(JSONObject step, String rawContent, JSONObject assistantMessage,
+			boolean thinkingEnabled) {
+		if (step == null) {
+			return describeJsonParseFailure(rawContent, assistantMessage, thinkingEnabled);
+		}
+
+		StringBuilder missing = new StringBuilder();
+		for (String field : new String[] { "step", "thought", "plan", "tool_call", "complete", "response" }) {
+			if (!step.has(field)) {
+				if (missing.length() > 0) {
+					missing.append(", ");
+				}
+				missing.append(field);
+			}
+		}
+		if (missing.length() > 0) {
+			return "missing required field(s): " + missing;
+		}
+
+		String stepName = step.optString("step", "");
+		if (!"think_and_plan".equals(stepName) && !"execute_tool".equals(stepName)
+				&& !"confirm_tool_results".equals(stepName) && !"check_complete".equals(stepName)
+				&& !"final".equals(stepName)) {
+			if (stepName.isBlank()) {
+				return "step is empty; expected one of think_and_plan, execute_tool, confirm_tool_results, check_complete, final";
+			}
+			return "invalid step value \"" + stepName
+					+ "\"; expected one of think_and_plan, execute_tool, confirm_tool_results, check_complete, final";
+		}
+
+		if (!step.isNull("tool_call") && step.optJSONObject("tool_call") == null) {
+			return "tool_call must be null or a JSON object, got " + jsonValueType(step.get("tool_call"));
+		}
+
+		return null;
+	}
+
+	private static String validateToolArgumentsShape(String toolName, JSONObject parsed, String rawContent,
+			JSONObject assistantMessage, boolean thinkingEnabled) {
+		if (parsed == null) {
+			return describeJsonParseFailure(rawContent, assistantMessage, thinkingEnabled);
+		}
+		if (parsed.has("step") || parsed.has("tool_call")) {
+			return "returned a full agent step object; expected tool arguments only for \"" + toolName + "\"";
+		}
+		if (parsed.length() == 0) {
+			return "empty JSON object; expected tool arguments for \"" + toolName + "\"";
+		}
+		return null;
+	}
+
+	private static String describeJsonParseFailure(String rawContent, JSONObject assistantMessage,
+			boolean thinkingEnabled) {
+		if (rawContent == null || rawContent.isBlank()) {
+			if (assistantMessage != null) {
+				int contentChars = assistantMessage.optString("content", "").length();
+				int thinkingChars = assistantMessage.optString("thinking", "").length();
+				if (contentChars == 0 && thinkingChars > 0) {
+					if (!thinkingEnabled) {
+						return "content field empty and thinking is disabled (model sent " + thinkingChars
+								+ " thinking chars)";
+					}
+					return "content field empty but thinking has " + thinkingChars
+							+ " chars; model may have put JSON only in the thinking channel";
+				}
+			}
+			return "empty response (" + describeAssistantMessageFields(assistantMessage) + ")";
+		}
+		String text = rawContent.trim();
+		if (text.startsWith("```")) {
+			return "response wrapped in markdown code fence; return raw JSON only";
+		}
+		if (!text.contains("{")) {
+			return "response is not a JSON object (no '{' found)";
+		}
+
+		String parseError = tryParseJsonObject(text);
+		if (parseError == null) {
+			return "could not parse JSON object from response";
+		}
+		return parseError;
+	}
+
+	private static String tryParseJsonObject(String text) {
+		try {
+			new JSONObject(text);
+			return null;
+		} catch (JSONException directError) {
+			int start = text.indexOf('{');
+			int end = text.lastIndexOf('}');
+			if (start >= 0 && end > start) {
+				try {
+					new JSONObject(text.substring(start, end + 1));
+					return null;
+				} catch (JSONException extractedError) {
+					return "invalid JSON: " + extractedError.getMessage();
+				}
+			}
+			return "invalid JSON: " + directError.getMessage();
+		}
+	}
+
+	private static String jsonValueType(Object value) {
+		if (value == null || value == JSONObject.NULL) {
+			return "null";
+		}
+		if (value instanceof JSONObject) {
+			return "object";
+		}
+		if (value instanceof JSONArray) {
+			return "array";
+		}
+		if (value instanceof Boolean) {
+			return "boolean";
+		}
+		if (value instanceof Number) {
+			return "number";
+		}
+		return "string";
+	}
+
 	private static String stripFence(String text) {
 		int firstNewline = text.indexOf('\n');
 		if (firstNewline >= 0) {
@@ -845,7 +1069,7 @@ public class AgentRunner {
 		if (text == null || text.isEmpty()) {
 			return "";
 		}
-		return "[subtask] " + text.replace("\n", "\n[subtask] ");
+		return text;
 	}
 
 	private static void appendEvidence(StringBuilder evidence, String toolName, JSONObject arguments, String result) {
@@ -1046,6 +1270,15 @@ public class AgentRunner {
 				.put("content", content));
 	}
 
+	private static void removeMessagesFrom(JSONArray messages, int startIndex) {
+		if (messages == null) {
+			return;
+		}
+		for (int i = messages.length() - 1; i >= startIndex; i--) {
+			messages.remove(i);
+		}
+	}
+
 	private static void throwIfCancelled(BooleanSupplier cancelRequested) throws InterruptedIOException {
 		if (cancelRequested.getAsBoolean()) {
 			throw new InterruptedIOException("Agent cancelled");
@@ -1155,6 +1388,108 @@ public class AgentRunner {
 				return trimmed;
 			}
 			return trimmed.substring(trimmed.length() - RUN_ANALYSIS_APPEND_CHARS);
+		}
+	}
+
+	private static class SubtaskWorkerGuard {
+		private int actionToolCount;
+
+		private String validateToolChoice(String name) {
+			if (actionToolCount < MAX_SUBTASK_WORKER_TOOLS || "done".equals(name)) {
+				return null;
+			}
+			return """
+					SUBTASK LIMIT:
+					Workers may run exactly one action tool, then must terminate with done.
+					You already used your single tool. Call done now with a concise summary for the master agent.
+					""";
+		}
+
+		private void observe(String name) {
+			if (name != null && !"done".equals(name)) {
+				actionToolCount++;
+			}
+		}
+
+		private boolean shouldFinishAfterTool(String name) {
+			return !"done".equals(name) && actionToolCount >= MAX_SUBTASK_WORKER_TOOLS;
+		}
+
+		private String finishInstruction() {
+			return """
+					Your single action tool has finished.
+					Do not call read, bash, run, edit, write, or maven again.
+					Your next and only step is done with a concise summary of the tool result.
+					""";
+		}
+	}
+
+	private static class DelegationGuard {
+		private static final int FORCE_AFTER_DIRECT_TOOLS = 5;
+		private static final int FORCE_AFTER_RESULT_CHARS = 45_000;
+		private static final int FORCE_AFTER_MESSAGE_CHARS = 90_000;
+		private int messageBaselineChars;
+		private int directToolCalls;
+		private int directResultChars;
+		private int warnings;
+
+		private DelegationGuard(JSONArray startingMessages) {
+			messageBaselineChars = messageChars(startingMessages);
+		}
+
+		private String validateToolChoice(String name, JSONArray messages) {
+			if (name == null || name.isBlank() || "subtask".equals(name) || "done".equals(name)
+					|| "run".equals(name)) {
+				return null;
+			}
+			int activeMessageChars = Math.max(0, messageChars(messages) - messageBaselineChars);
+			boolean directToolLimitReached = directToolCalls >= FORCE_AFTER_DIRECT_TOOLS;
+			boolean resultLimitReached = directResultChars >= FORCE_AFTER_RESULT_CHARS;
+			boolean messageLimitReached = activeMessageChars >= FORCE_AFTER_MESSAGE_CHARS;
+			if (!directToolLimitReached && !resultLimitReached && !messageLimitReached) {
+				return null;
+			}
+			warnings++;
+			return """
+					CONTEXT BUDGET WARNING:
+					The master agent has continued with direct tools without delegating.
+					Context added since the last worker roughly %d chars; direct tool output roughly %d chars across %d direct tool call(s).
+
+					Do not run "%s" now. Your next JSON must use step=execute_tool with tool_call.name="subtask".
+					Delegate one narrow, self-contained unit of work to a worker agent and include enough context for that worker to finish.
+					After the subtask returns, inspect SUBTASK_STATUS, SUBTASK_TOOL_CALLS, and SUBTASK_EVIDENCE before continuing.
+					This is delegation warning #%d; continuing without subtask risks exhausting the main context.
+					""".formatted(activeMessageChars, directResultChars, directToolCalls, name, warnings);
+		}
+
+		private void observe(String name, String output, JSONArray messages) {
+			if ("subtask".equals(name)) {
+				directToolCalls = 0;
+				directResultChars = 0;
+				messageBaselineChars = messageChars(messages);
+				return;
+			}
+			if ("done".equals(name) || "run".equals(name)) {
+				return;
+			}
+			directToolCalls++;
+			if (output != null) {
+				directResultChars += output.length();
+			}
+		}
+
+		private static int messageChars(JSONArray messages) {
+			if (messages == null) {
+				return 0;
+			}
+			int chars = 0;
+			for (int i = 0; i < messages.length(); i++) {
+				Object value = messages.opt(i);
+				if (value != null) {
+					chars += value.toString().length();
+				}
+			}
+			return chars;
 		}
 	}
 }

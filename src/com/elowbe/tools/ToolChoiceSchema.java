@@ -19,6 +19,7 @@ public class ToolChoiceSchema {
 				.put("step")
 				.put("thought")
 				.put("plan")
+				.put("tool_call")
 				.put("complete")
 				.put("response"));
 
@@ -102,7 +103,9 @@ public class ToolChoiceSchema {
 		case "subtask" -> argumentsSchema(
 				new JSONArray().put("task"),
 				new JSONObject()
-						.put("task", stringProperty("Self-contained goal for the worker agent."))
+						.put("task", stringProperty(
+								"Exactly one atomic action for the worker (one read, one edit, one search, one maven action, etc.). "
+										+ "Do not pass a multi-step plan or checklist."))
 						.put("context", stringProperty("Optional brief context from the master agent.")));
 		case "done" -> argumentsSchema(
 				new JSONArray().put("response"),

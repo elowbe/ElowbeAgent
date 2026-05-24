@@ -37,14 +37,36 @@ import lib.console.widgets.OptionsWidget;
 
 public class ElowbeAgent extends JinCanvas {
 	private static final File SYSTEM_PROMPT_FILE = resolveSystemPromptFile();
+	private static final File SYSTEM_DIRECT_PROMPT_FILE = resolveSystemPromptFile("system-direct.txt");
+	private static final File SYSTEM_SUBTASKS_PROMPT_FILE = resolveSystemPromptFile("system-subtasks.txt");
+	private static final String SUBTASK_DESIGNATION_RULES = """
+			Subtask designation rules:
+			Each subtask call must delegate exactly one atomic action (one read, one edit, one search, one maven action, etc.).
+			Do not write multi-step checklists, numbered plans, or compound goals in subtask.task.
+			Workers run one action tool and terminate; break multi-step work into separate subtask calls.
+			""";
 
-	/** Ollama model used for non-slash agent instructions. */
-	private static String agentModel = "qwen3.6:27b";
+	/** LLM model used for non-slash agent instructions (Ollama name or lmstudio: / claude: prefix). */
+	private static String agentModel = "lmstudio:qwen3.6-27b-mtp";
 	private static String ollamaUrl = "http://10.0.0.8:11434";
+	/** LM Studio OpenAI-compatible API base URL (local server default port 1234). */
+	private static String lmstudioUrl = "http://10.0.0.8:1234/v1";
+	/** Context window for LLM calls (Ollama {@code num_ctx}, LM Studio {@code context_length}); {@code 0} = server default. */
+	private static int agentContextLength = 0;
+	/** Maximum tokens generated per LLM response; {@code 0} = server default. */
+	private static int agentMaxOutputTokens = 32000;
+	/**
+	 * When false, thinking/reasoning tokens are not shown and the thinking channel is not used as model output.
+	 */
+	private boolean thinkingEnabled = true;
+	/** When false, the subtask tool and delegation guard are disabled. */
+	private boolean subtasksEnabled = true;
 	InputWidget commandInput;
 	PrintWidget printWidget;
 	File directory;
 	private String systemPrompt = "";
+	private String directSystemPrompt = "";
+	private String subtasksSystemPrompt = "";
 	/** Primary skill.md supplement loaded for the current working directory. */
 	private Skill primarySkill = Skill.parse("", null);
 	/** Additional skills discovered under .cursor/skills/ or skills/. */
@@ -90,6 +112,10 @@ public class ElowbeAgent extends JinCanvas {
 		// Makes a window with 1280x720 pixel resolution and a console of 40 columns and
 		// 30 rows.
 		OllamaAPI.BASE_URL = ollamaUrl;
+		OllamaAPI.LMSTUDIO_BASE_URL = lmstudioUrl;
+		OllamaAPI.setContextLength(agentContextLength);
+		OllamaAPI.setMaxOutputTokens(agentMaxOutputTokens);
+		OllamaAPI.thinkingEnabled = false;
 		Runtime.getRuntime().addShutdownHook(new Thread(ElowbeAgent::shutdownAllProcesses, "elowbe-agent-shutdown"));
 		JinConsole.start(new ElowbeAgent(), "Agent", 120, 40, 960, 720);
 	}
@@ -122,7 +148,11 @@ public class ElowbeAgent extends JinCanvas {
 	}
 
 	private static File resolveSystemPromptFile() {
-		File[] candidates = { new File("src/system.txt"), new File("system.txt") };
+		return resolveSystemPromptFile("system.txt");
+	}
+
+	private static File resolveSystemPromptFile(String fileName) {
+		File[] candidates = { new File("src/" + fileName), new File(fileName) };
 		for (File candidate : candidates) {
 			if (candidate.isFile()) {
 				return candidate;
@@ -132,14 +162,24 @@ public class ElowbeAgent extends JinCanvas {
 	}
 
 	private void loadSystemPrompt() {
-		if (!SYSTEM_PROMPT_FILE.isFile()) {
-			systemPrompt = "";
-			return;
+		systemPrompt = readPromptFile(SYSTEM_PROMPT_FILE, "system prompt");
+		loadSystemPromptSupplements();
+	}
+
+	private void loadSystemPromptSupplements() {
+		directSystemPrompt = readPromptFile(SYSTEM_DIRECT_PROMPT_FILE, "direct-work system prompt");
+		subtasksSystemPrompt = readPromptFile(SYSTEM_SUBTASKS_PROMPT_FILE, "subtasks system prompt");
+	}
+
+	private String readPromptFile(File file, String label) {
+		if (!file.isFile()) {
+			return "";
 		}
 		try {
-			systemPrompt = Files.readString(SYSTEM_PROMPT_FILE.toPath(), StandardCharsets.UTF_8).trim();
+			return Files.readString(file.toPath(), StandardCharsets.UTF_8).trim();
 		} catch (IOException e) {
-			printWidget.println("Failed to load system prompt: " + e.getMessage());
+			printWidget.println("Failed to load " + label + ": " + e.getMessage());
+			return "";
 		}
 	}
 
@@ -245,6 +285,13 @@ public class ElowbeAgent extends JinCanvas {
 			resolved.append("\n\n");
 		}
 		resolved.append("Host operating system: ").append(detectOperatingSystem());
+		String sessionModePrompt = subtasksEnabled ? subtasksSystemPrompt : directSystemPrompt;
+		if (sessionModePrompt != null && !sessionModePrompt.isBlank()) {
+			resolved.append("\n\n").append(sessionModePrompt);
+		}
+		if (subtasksEnabled) {
+			resolved.append("\n\n").append(SUBTASK_DESIGNATION_RULES);
+		}
 		return resolved.toString();
 	}
 
@@ -497,7 +544,9 @@ public class ElowbeAgent extends JinCanvas {
 
 		Thread thread = new Thread(() -> {
 			String previousModel = OllamaAPI.model;
+			boolean previousThinking = OllamaAPI.thinkingEnabled;
 			OllamaAPI.model = agentModel;
+			OllamaAPI.thinkingEnabled = thinkingEnabled;
 			try {
 				selectedSkillsForRun = List.of();
 				lastSkillSelectionNote = null;
@@ -519,7 +568,7 @@ public class ElowbeAgent extends JinCanvas {
 						SkillSelector.SkillSelectionResult selection = SkillSelector.select(instruction,
 								skillCandidates, directory,
 								() -> agentCancelRequested.get() || Thread.currentThread().isInterrupted(),
-								this::addAgentTokenUsage);
+								this::addAgentTokenUsage, thinkingEnabled);
 						selectedSkillsForRun = selection.skills();
 						lastSkillSelectionNote = selection.note();
 					} catch (IOException e) {
@@ -552,15 +601,16 @@ public class ElowbeAgent extends JinCanvas {
 						targetColor = Colors.randomColorFromSeed("" + Math.random() * 1000000L, .95f, 1f);
 						t=0;
 					}
-				}, thinking -> {
-					if(t < 0) {
+				}, thinkingEnabled ? thinking -> {
+					if (t < 0) {
 						targetColor = Colors.randomColorFromSeed("" + Math.random() * 1000000L, .95f, 1f);
-						t=0;
+						t = 0;
 					}
-					// printWidget.setColor(subtaskActive ? Colors.darkblue : Colors.lightgray);
-					// printWidget.print(thinking);
-				}, (name, args, result) -> logToolActivity(name, args, result), this::addAgentTokenUsage,
-						() -> agentCancelRequested.get() || Thread.currentThread().isInterrupted());
+					printWidget.setColor(subtaskActive ? Colors.darkblue : Colors.lightgray);
+					printWidget.print(thinking);
+				} : null, (name, args, result) -> logToolActivity(name, args, result), this::addAgentTokenUsage,
+						() -> agentCancelRequested.get() || Thread.currentThread().isInterrupted(), thinkingEnabled,
+						subtasksEnabled);
 
 				if (!agentCancelRequested.get()) {
 					for (int i = turnStart; i < request.length(); i++) {
@@ -592,6 +642,7 @@ public class ElowbeAgent extends JinCanvas {
 				}
 			} finally {
 				OllamaAPI.model = previousModel;
+				OllamaAPI.thinkingEnabled = previousThinking;
 				agentBusy = false;
 				subtaskActive = false;
 				agentCancelRequested.set(false);
@@ -787,6 +838,155 @@ public class ElowbeAgent extends JinCanvas {
 		}
 	}
 
+	public boolean isThinkingEnabled() {
+		return thinkingEnabled;
+	}
+
+	public void setThinkingEnabled(boolean thinkingEnabled) {
+		this.thinkingEnabled = thinkingEnabled;
+		OllamaAPI.thinkingEnabled = thinkingEnabled;
+	}
+
+	public boolean isSubtasksEnabled() {
+		return subtasksEnabled;
+	}
+
+	public void setSubtasksEnabled(boolean subtasksEnabled) {
+		this.subtasksEnabled = subtasksEnabled;
+	}
+
+	private void handleSubtasksCommand(Command cmd) {
+		if (cmd.has("on") || cmd.has("enable")) {
+			setSubtasksEnabled(true);
+			printWidget.println("Subtasks enabled. Next agent run uses " + SYSTEM_SUBTASKS_PROMPT_FILE.getPath() + ".");
+			return;
+		}
+		if (cmd.has("off") || cmd.has("disable")) {
+			setSubtasksEnabled(false);
+			printWidget.println("Subtasks disabled. Next agent run uses " + SYSTEM_DIRECT_PROMPT_FILE.getPath() + ".");
+			return;
+		}
+		if (cmd.has("show")) {
+			printWidget.println("Subtasks: " + (subtasksEnabled ? "enabled" : "disabled"));
+			return;
+		}
+		printWidget.println("Subtasks: " + (subtasksEnabled ? "enabled" : "disabled"));
+		printWidget.println("  /subtasks -on              enable worker subtask delegation");
+		printWidget.println("  /subtasks -off             disable worker subtask delegation");
+		printWidget.println("  /subtasks -show            show current setting");
+	}
+
+	public int getAgentContextLength() {
+		return agentContextLength;
+	}
+
+	public void setAgentContextLength(int agentContextLength) {
+		if (agentContextLength < 0) {
+			throw new IllegalArgumentException("context length must be >= 0");
+		}
+		ElowbeAgent.agentContextLength = agentContextLength;
+		OllamaAPI.setContextLength(agentContextLength);
+	}
+
+	public int getAgentMaxOutputTokens() {
+		return agentMaxOutputTokens;
+	}
+
+	public void setAgentMaxOutputTokens(int agentMaxOutputTokens) {
+		if (agentMaxOutputTokens < 0) {
+			throw new IllegalArgumentException("max output tokens must be >= 0");
+		}
+		ElowbeAgent.agentMaxOutputTokens = agentMaxOutputTokens;
+		OllamaAPI.setMaxOutputTokens(agentMaxOutputTokens);
+	}
+
+	private static String formatContextLength(int length) {
+		return length <= 0 ? "server default" : String.valueOf(length);
+	}
+
+	private static String formatMaxOutputTokens(int tokens) {
+		return tokens <= 0 ? "server default" : String.valueOf(tokens);
+	}
+
+	private void handleThinkingCommand(Command cmd) {
+		if (cmd.has("on") || cmd.has("enable")) {
+			setThinkingEnabled(true);
+			printWidget.println("Thinking enabled.");
+			return;
+		}
+		if (cmd.has("off") || cmd.has("disable")) {
+			setThinkingEnabled(false);
+			printWidget.println("Thinking disabled.");
+			return;
+		}
+		if (cmd.has("show")) {
+			printWidget.println("Thinking: " + (thinkingEnabled ? "enabled" : "disabled"));
+			return;
+		}
+		printWidget.println("Thinking: " + (thinkingEnabled ? "enabled" : "disabled"));
+		printWidget.println("  /thinking -on              enable thinking/reasoning output");
+		printWidget.println("  /thinking -off             disable thinking/reasoning output");
+		printWidget.println("  /thinking -show            show current setting");
+	}
+
+	private void handleContextCommand(Command cmd) {
+		if (cmd.has("set")) {
+			String value = cmd.get("set");
+			if (value == null || value.isBlank()) {
+				printWidget.println("Error: -set requires a token count (use 0 for server default)");
+				return;
+			}
+			try {
+				int length = Integer.parseInt(value.trim());
+				if (length < 0) {
+					printWidget.println("Error: context length must be >= 0");
+					return;
+				}
+				setAgentContextLength(length);
+				printWidget.println("Context length set to " + formatContextLength(length) + ".");
+			} catch (NumberFormatException e) {
+				printWidget.println("Error: invalid context length: " + value);
+			}
+			return;
+		}
+		if (cmd.has("show")) {
+			printWidget.println("Context length: " + formatContextLength(agentContextLength));
+			return;
+		}
+		printWidget.println("Context length: " + formatContextLength(agentContextLength));
+		printWidget.println("  /context -show             show current context length");
+		printWidget.println("  /context -set N            set context tokens (0 = server default)");
+	}
+
+	private void handleOutputCommand(Command cmd) {
+		if (cmd.has("set")) {
+			String value = cmd.get("set");
+			if (value == null || value.isBlank()) {
+				printWidget.println("Error: -set requires a token count (use 0 for server default)");
+				return;
+			}
+			try {
+				int tokens = Integer.parseInt(value.trim());
+				if (tokens < 0) {
+					printWidget.println("Error: max output tokens must be >= 0");
+					return;
+				}
+				setAgentMaxOutputTokens(tokens);
+				printWidget.println("Max output tokens set to " + formatMaxOutputTokens(tokens) + ".");
+			} catch (NumberFormatException e) {
+				printWidget.println("Error: invalid max output tokens: " + value);
+			}
+			return;
+		}
+		if (cmd.has("show")) {
+			printWidget.println("Max output tokens: " + formatMaxOutputTokens(agentMaxOutputTokens));
+			return;
+		}
+		printWidget.println("Max output tokens: " + formatMaxOutputTokens(agentMaxOutputTokens));
+		printWidget.println("  /output -show              show current max output tokens");
+		printWidget.println("  /output -set N             set max generated tokens (0 = server default)");
+	}
+
 	private void handleCommand(Command cmd) {
 		switch (cmd.getName()) {
 		case "help" -> printHelp(cmd);
@@ -800,6 +1000,10 @@ public class ElowbeAgent extends JinCanvas {
 			currentStreamTokenTotal = 0;
 		}
 		case "model" -> openModelPicker();
+		case "thinking" -> handleThinkingCommand(cmd);
+		case "subtasks" -> handleSubtasksCommand(cmd);
+		case "context" -> handleContextCommand(cmd);
+		case "output" -> handleOutputCommand(cmd);
 		case "system" -> handleSystemCommand(cmd);
 		case "skill" -> handleSkillCommand(cmd);
 		case "review" -> startGitReview();
@@ -943,6 +1147,11 @@ public class ElowbeAgent extends JinCanvas {
 			loadSystemPrompt();
 			printWidget.println("System prompt reloaded from " + SYSTEM_PROMPT_FILE.getPath() + " ("
 					+ systemPrompt.length() + " chars)");
+			printWidget.println("Direct mode supplement: " + SYSTEM_DIRECT_PROMPT_FILE.getPath() + " ("
+					+ directSystemPrompt.length() + " chars)");
+			printWidget.println("Subtasks supplement: " + SYSTEM_SUBTASKS_PROMPT_FILE.getPath() + " ("
+					+ subtasksSystemPrompt.length() + " chars)");
+			printWidget.println("Active session mode: " + (subtasksEnabled ? "subtasks enabled" : "subtasks disabled"));
 			return;
 		}
 		if (cmd.has("set")) {
@@ -969,7 +1178,10 @@ public class ElowbeAgent extends JinCanvas {
 			return;
 		}
 		printWidget.println("System prompt file: " + SYSTEM_PROMPT_FILE.getAbsolutePath());
+		printWidget.println("Direct mode file: " + SYSTEM_DIRECT_PROMPT_FILE.getAbsolutePath());
+		printWidget.println("Subtasks mode file: " + SYSTEM_SUBTASKS_PROMPT_FILE.getAbsolutePath());
 		printWidget.println("Length: " + systemPrompt.length() + " chars");
+		printWidget.println("Active session mode: " + (subtasksEnabled ? "subtasks enabled" : "subtasks disabled"));
 		printWidget.println("  /system -show              show current prompt");
 		printWidget.println("  /system -reload            reload from file");
 		printWidget.println("  /system -set \"...\"         set and save prompt");
@@ -1521,7 +1733,11 @@ public class ElowbeAgent extends JinCanvas {
 		if (cmd.has("commands")) {
 			printWidget.println("/help -commands    show this list");
 			printWidget.println("/clear             clear chat history");
-			printWidget.println("/model             choose Ollama model");
+			printWidget.println("/model             choose LLM model (Ollama, LM Studio, Claude)");
+			printWidget.println("/thinking          enable or disable thinking/reasoning output");
+			printWidget.println("/subtasks          enable or disable worker subtask delegation");
+			printWidget.println("/context           set LLM context window size");
+			printWidget.println("/output            set max tokens generated per LLM response");
 			printWidget.println("/system            system prompt (" + SYSTEM_PROMPT_FILE.getPath() + ")");
 			printWidget.println("/skill             skill.md supplement and .cursor/skills/");
 			printWidget.println("/review            review agent changes and commit");
@@ -1540,6 +1756,10 @@ public class ElowbeAgent extends JinCanvas {
 		printWidget.println("Terminal: cd, ls, mkdir. Other input goes to the agent.");
 		printWidget.println("  /help -commands");
 		printWidget.println("  /model");
+		printWidget.println("  /thinking -show");
+		printWidget.println("  /subtasks -show");
+		printWidget.println("  /context -show");
+		printWidget.println("  /output -show");
 		printWidget.println("  /system -show");
 		printWidget.println("  /skill -list");
 		printWidget.println("  /review");
