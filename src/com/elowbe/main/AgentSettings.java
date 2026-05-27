@@ -18,11 +18,15 @@ public final class AgentSettings {
 	private static final File SETTINGS_FILE = new File(SETTINGS_DIR, "settings.json");
 
 	private static final String DEFAULT_AGENT_MODEL = "lmstudio:qwen3.6-27b-mtp";
+	private static final String DEFAULT_OLLAMA_URL = "http://10.0.0.8:11434";
+	private static final String DEFAULT_LMSTUDIO_URL = "http://10.0.0.8:1234/v1";
 	private static final String DEFAULT_AGENT_BROWSER_COMMAND = "agent-browser --json";
 	private static final int DEFAULT_AGENT_MAX_OUTPUT_TOKENS = 32000;
 
 	private File projectsDirectory;
 	private String agentModel = DEFAULT_AGENT_MODEL;
+	private String ollamaUrl = DEFAULT_OLLAMA_URL;
+	private String lmstudioUrl = DEFAULT_LMSTUDIO_URL;
 	private boolean thinkingEnabled = true;
 	private boolean subtasksEnabled = false;
 	private boolean agentBrowserWebEnabled = true;
@@ -51,6 +55,8 @@ public final class AgentSettings {
 			settings.projectsDirectory = path.isBlank() ? defaultProjectsDirectory()
 					: new File(path).getAbsoluteFile();
 			settings.agentModel = json.optString("agentModel", DEFAULT_AGENT_MODEL);
+			settings.ollamaUrl = json.optString("ollamaUrl", DEFAULT_OLLAMA_URL);
+			settings.lmstudioUrl = json.optString("lmstudioUrl", DEFAULT_LMSTUDIO_URL);
 			settings.thinkingEnabled = json.optBoolean("thinkingEnabled", true);
 			settings.subtasksEnabled = json.optBoolean("subtasksEnabled", false);
 			settings.agentBrowserWebEnabled = json.optBoolean("agentBrowserWebEnabled", true);
@@ -80,6 +86,8 @@ public final class AgentSettings {
 
 	public void applyTo(ElowbeAgent agent) {
 		agent.setAgentModel(agentModel);
+		agent.setOllamaUrl(ollamaUrl);
+		agent.setLmstudioUrl(lmstudioUrl);
 		agent.setThinkingEnabled(thinkingEnabled);
 		agent.setSubtasksEnabled(subtasksEnabled);
 		agent.setAgentBrowserWebEnabled(agentBrowserWebEnabled);
@@ -91,6 +99,8 @@ public final class AgentSettings {
 
 	public void captureFrom(ElowbeAgent agent) {
 		agentModel = agent.getAgentModel();
+		ollamaUrl = agent.getOllamaUrl();
+		lmstudioUrl = agent.getLmstudioUrl();
 		thinkingEnabled = agent.isThinkingEnabled();
 		subtasksEnabled = agent.isSubtasksEnabled();
 		agentBrowserWebEnabled = agent.isAgentBrowserWebEnabled();
@@ -150,6 +160,8 @@ public final class AgentSettings {
 		JSONObject json = new JSONObject();
 		json.put("projectsDirectory", projectsDirectory.getAbsolutePath());
 		json.put("agentModel", agentModel);
+		json.put("ollamaUrl", ollamaUrl);
+		json.put("lmstudioUrl", lmstudioUrl);
 		json.put("thinkingEnabled", thinkingEnabled);
 		json.put("subtasksEnabled", subtasksEnabled);
 		json.put("agentBrowserWebEnabled", agentBrowserWebEnabled);

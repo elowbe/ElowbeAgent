@@ -63,7 +63,7 @@ public class ElowbeAgent extends JinCanvas {
 	 */
 	private static int agentContextLength = 0;
 	/** Maximum tokens generated per LLM response; {@code 0} = server default. */
-	private static int agentMaxOutputTokens = 32000;
+	private static int agentMaxOutputTokens = 64000;
 	/**
 	 * When false, thinking/reasoning tokens are not shown and the thinking channel
 	 * is not used as model output.
@@ -983,6 +983,30 @@ public class ElowbeAgent extends JinCanvas {
 		}
 	}
 
+	public String getOllamaUrl() {
+		return ollamaUrl;
+	}
+
+	public void setOllamaUrl(String url) {
+		if (url != null && !url.isBlank()) {
+			ollamaUrl = url.trim();
+			OllamaAPI.BASE_URL = ollamaUrl;
+			persistUserSettings();
+		}
+	}
+
+	public String getLmstudioUrl() {
+		return lmstudioUrl;
+	}
+
+	public void setLmstudioUrl(String url) {
+		if (url != null && !url.isBlank()) {
+			lmstudioUrl = url.trim();
+			OllamaAPI.LMSTUDIO_BASE_URL = lmstudioUrl;
+			persistUserSettings();
+		}
+	}
+
 	public boolean isThinkingEnabled() {
 		return thinkingEnabled;
 	}
@@ -1214,6 +1238,42 @@ public class ElowbeAgent extends JinCanvas {
 		printWidget.println("  /context -set N            set context tokens (0 = server default)");
 	}
 
+	private void handleLlmCommand(Command cmd) {
+		if (cmd.has("ollama")) {
+			String value = cmd.get("ollama");
+			if (value == null || value.isBlank()) {
+				printWidget.println("Error: -ollama requires a base URL (e.g. http://localhost:11434)");
+				return;
+			}
+			setOllamaUrl(value);
+			printWidget.println("Ollama URL set to " + ollamaUrl);
+			return;
+		}
+		if (cmd.has("lmstudio")) {
+			String value = cmd.get("lmstudio");
+			if (value == null || value.isBlank()) {
+				printWidget.println("Error: -lmstudio requires an API base URL (e.g. http://localhost:1234/v1)");
+				return;
+			}
+			setLmstudioUrl(value);
+			printWidget.println("LM Studio URL set to " + lmstudioUrl);
+			return;
+		}
+		if (cmd.has("show")) {
+			printLlmStatus();
+			return;
+		}
+		printLlmStatus();
+		printWidget.println("  /llm -show                                      show current LLM server URLs");
+		printWidget.println("  /llm -ollama http://host:11434                  set Ollama API base URL");
+		printWidget.println("  /llm -lmstudio http://host:1234/v1              set LM Studio OpenAI API base URL");
+	}
+
+	private void printLlmStatus() {
+		printWidget.println("Ollama URL: " + ollamaUrl);
+		printWidget.println("LM Studio URL: " + lmstudioUrl);
+	}
+
 	private void handleOutputCommand(Command cmd) {
 		if (cmd.has("set")) {
 			String value = cmd.get("set");
@@ -1270,6 +1330,7 @@ public class ElowbeAgent extends JinCanvas {
 			currentStreamTokenTotal = 0;
 		}
 		case "model" -> openModelPicker();
+		case "llm" -> handleLlmCommand(cmd);
 		case "thinking" -> handleThinkingCommand(cmd);
 		case "subtasks" -> handleSubtasksCommand(cmd);
 		case "web" -> handleWebCommand(cmd);
@@ -2216,6 +2277,7 @@ public class ElowbeAgent extends JinCanvas {
 			printWidget.println("/help -commands    show this list");
 			printWidget.println("/clear             clear chat history");
 			printWidget.println("/model             choose LLM model (Ollama, LM Studio, Claude)");
+			printWidget.println("/llm               set Ollama and LM Studio API base URLs");
 			printWidget.println("/thinking          enable or disable thinking/reasoning output");
 			printWidget.println("/subtasks          enable or disable worker subtask delegation");
 			printWidget.println("/web               configure web tool backend (Selenium or agent-browser)");
@@ -2240,6 +2302,7 @@ public class ElowbeAgent extends JinCanvas {
 		printWidget.println("Terminal: cd, ls, mkdir. Other input goes to the agent.");
 		printWidget.println("  /help -commands");
 		printWidget.println("  /model");
+		printWidget.println("  /llm -show");
 		printWidget.println("  /thinking -show");
 		printWidget.println("  /subtasks -show");
 		printWidget.println("  /web -show");

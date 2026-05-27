@@ -244,37 +244,14 @@ public class AgentRunner {
 			if (subtaskDepth > 0 && thinkingSink != null) {
 				thinkingSink.accept("Subtask worker turn " + (turn + 1) + " started\n");
 			}
-			JSONObject assistantMessage = OllamaAPI.streamChatCompletion(messages, null, format,
-					new OllamaAPI.ChatStreamListener() {
-						@Override
-						public void onToken(String token) {
-							if (token == null || token.isEmpty()) {
-								return;
-							}
-							if (subtaskDepth > 0) {
-								if (thinkingSink != null) {
-									thinkingSink.accept(prefixSubtaskOutput(token));
-								}
-							}
-						}
-
-						@Override
-						public void onThinking(String token) {
-							if (token == null || token.isEmpty() || thinkingSink == null) {
-								return;
-							}
-							if (subtaskDepth > 0) {
-								thinkingSink.accept(prefixSubtaskOutput(token));
-							}
-						}
-
-						@Override
-						public void onUsage(JSONObject usage) {
-							emitStreamingUsage(usage, usageSink);
-						}
-					}, null, cancelRequested);
-			emitUsage(assistantMessage, usageSink);
-			assistantMessage.remove("usage");
+			LlmCallResult llmResult = streamChatCompletionWithRetries(messages, format, thinkingSink, usageSink,
+					cancelRequested, subtaskDepth, "agent step");
+			if (!llmResult.ok()) {
+				appendLlmCallFailure(messages, "agent step", llmResult.error());
+				stepRetryStreak = 0;
+				continue;
+			}
+			JSONObject assistantMessage = llmResult.message();
 			throwIfCancelled(cancelRequested);
 
 			String rawStepContent = extractAssistantText(assistantMessage, thinkingEnabled);
@@ -284,7 +261,10 @@ public class AgentRunner {
 				stepRetryStreak++;
 				logSchemaRetry("agent step", stepRetryStreak, MAX_SCHEMA_RETRIES, stepShapeError, rawStepContent);
 				if (stepRetryStreak >= MAX_SCHEMA_RETRIES) {
-					throwSchemaRetryExhausted("agent step JSON", MAX_SCHEMA_RETRIES);
+					appendLlmCallFailure(messages, "agent step JSON",
+							schemaRetryExhaustedMessage("agent step JSON", MAX_SCHEMA_RETRIES)
+									+ " Last validation error: " + stepShapeError);
+					stepRetryStreak = 0;
 				}
 				continue;
 			}
@@ -757,37 +737,14 @@ public class AgentRunner {
 		appendUserInstruction(messages, toolArgumentPrompt(toolName, selectionStep));
 
 		for (int attempt = 1; attempt <= MAX_SCHEMA_RETRIES; attempt++) {
-			JSONObject assistantMessage = OllamaAPI.streamChatCompletion(messages, null, format,
-					new OllamaAPI.ChatStreamListener() {
-						@Override
-						public void onToken(String token) {
-							if (token == null || token.isEmpty()) {
-								return;
-							}
-							if (subtaskDepth > 0) {
-								if (thinkingSink != null) {
-									thinkingSink.accept(prefixSubtaskOutput(token));
-								}
-							}
-						}
-
-						@Override
-						public void onThinking(String token) {
-							if (token == null || token.isEmpty() || thinkingSink == null) {
-								return;
-							}
-							if (subtaskDepth > 0) {
-								thinkingSink.accept(prefixSubtaskOutput(token));
-							}
-						}
-
-						@Override
-						public void onUsage(JSONObject usage) {
-							emitStreamingUsage(usage, usageSink);
-						}
-					}, null, cancelRequested);
-			emitUsage(assistantMessage, usageSink);
-			assistantMessage.remove("usage");
+			LlmCallResult llmResult = streamChatCompletionWithRetries(messages, format, thinkingSink, usageSink,
+					cancelRequested, subtaskDepth, "tool arguments for \"" + toolName + "\"");
+			if (!llmResult.ok()) {
+				removeMessagesFrom(messages, messageCountBeforeArguments);
+				appendLlmCallFailure(messages, "tool arguments for \"" + toolName + "\"", llmResult.error());
+				return null;
+			}
+			JSONObject assistantMessage = llmResult.message();
 			throwIfCancelled(cancelRequested);
 
 			String rawArgumentContent = extractAssistantText(assistantMessage, thinkingEnabled);
@@ -799,7 +756,10 @@ public class AgentRunner {
 						argumentError, rawArgumentContent);
 				if (attempt >= MAX_SCHEMA_RETRIES) {
 					removeMessagesFrom(messages, messageCountBeforeArguments);
-					return throwSchemaRetryExhausted("tool arguments for \"" + toolName + "\"", MAX_SCHEMA_RETRIES);
+					appendLlmCallFailure(messages, "tool arguments for \"" + toolName + "\"",
+							schemaRetryExhaustedMessage("tool arguments for \"" + toolName + "\"", MAX_SCHEMA_RETRIES)
+									+ " Last validation error: " + argumentError);
+					return null;
 				}
 				continue;
 			}
@@ -812,7 +772,9 @@ public class AgentRunner {
 			return normalizeToolArguments(toolName, selectionStep, parsed);
 		}
 		removeMessagesFrom(messages, messageCountBeforeArguments);
-		return throwSchemaRetryExhausted("tool arguments for \"" + toolName + "\"", MAX_SCHEMA_RETRIES);
+		appendLlmCallFailure(messages, "tool arguments for \"" + toolName + "\"",
+				schemaRetryExhaustedMessage("tool arguments for \"" + toolName + "\"", MAX_SCHEMA_RETRIES));
+		return null;
 	}
 
 	private static JSONObject normalizeToolArguments(String toolName, JSONObject selectionStep, JSONObject arguments) {
@@ -912,9 +874,83 @@ public class AgentRunner {
 				+ reason + (preview.isBlank() ? "" : " | response: " + preview));
 	}
 
-	private static JSONObject throwSchemaRetryExhausted(String context, int maxAttempts) throws IOException {
-		throw new IOException("Agent error: LLM failed to return valid JSON for " + context + " after "
-				+ maxAttempts + " attempts");
+	private static void logRequestRetry(String context, int attempt, int maxAttempts, String reason) {
+		System.out.println("[ElowbeAgent] LLM request retry " + attempt + "/" + maxAttempts + " (" + context + "): "
+				+ reason);
+	}
+
+	private static String schemaRetryExhaustedMessage(String context, int maxAttempts) {
+		return "LLM failed to return valid JSON for " + context + " after " + maxAttempts + " attempts";
+	}
+
+	private static void appendLlmCallFailure(JSONArray messages, String context, String detail) {
+		appendUserInstruction(messages, """
+				LLM call failed (%s): %s
+				This is the output from the failed model request. Recover if you can — use a different approach,
+				retry with a simpler step, or call done with a clear explanation.
+				""".formatted(context, detail == null ? "(unknown error)" : detail.trim()));
+	}
+
+	private static LlmCallResult streamChatCompletionWithRetries(JSONArray messages, JSONObject format,
+			ThinkingSink thinkingSink, UsageSink usageSink, BooleanSupplier cancelRequested, int subtaskDepth,
+			String context) throws IOException {
+		OllamaAPI.ChatStreamListener listener = buildStreamListener(thinkingSink, usageSink, subtaskDepth);
+		IOException lastError = null;
+		for (int attempt = 1; attempt <= MAX_SCHEMA_RETRIES; attempt++) {
+			throwIfCancelled(cancelRequested);
+			try {
+				JSONObject assistantMessage = OllamaAPI.streamChatCompletion(messages, null, format, listener, null,
+						cancelRequested);
+				emitUsage(assistantMessage, usageSink);
+				if (assistantMessage != null) {
+					assistantMessage.remove("usage");
+				}
+				return new LlmCallResult(assistantMessage, null);
+			} catch (IOException e) {
+				if (cancelRequested.getAsBoolean() || e instanceof InterruptedIOException) {
+					throw e;
+				}
+				lastError = e;
+				logRequestRetry(context, attempt, MAX_SCHEMA_RETRIES, e.getMessage());
+			}
+		}
+		return new LlmCallResult(null, lastError == null ? "request failed" : lastError.getMessage());
+	}
+
+	private static OllamaAPI.ChatStreamListener buildStreamListener(ThinkingSink thinkingSink, UsageSink usageSink,
+			int subtaskDepth) {
+		return new OllamaAPI.ChatStreamListener() {
+			@Override
+			public void onToken(String token) {
+				if (token == null || token.isEmpty()) {
+					return;
+				}
+				if (subtaskDepth > 0 && thinkingSink != null) {
+					thinkingSink.accept(prefixSubtaskOutput(token));
+				}
+			}
+
+			@Override
+			public void onThinking(String token) {
+				if (token == null || token.isEmpty() || thinkingSink == null) {
+					return;
+				}
+				if (subtaskDepth > 0) {
+					thinkingSink.accept(prefixSubtaskOutput(token));
+				}
+			}
+
+			@Override
+			public void onUsage(JSONObject usage) {
+				emitStreamingUsage(usage, usageSink);
+			}
+		};
+	}
+
+	private record LlmCallResult(JSONObject message, String error) {
+		private boolean ok() {
+			return message != null && error == null;
+		}
 	}
 
 	private static void normalizeAssistantMessageContent(JSONObject assistantMessage, boolean thinkingEnabled) {
