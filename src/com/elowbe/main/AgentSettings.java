@@ -4,17 +4,32 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.util.ArrayList;
+import java.util.List;
 
+import org.json.JSONArray;
 import org.json.JSONObject;
 
 /**
- * Persistent user settings for ElowbeAgent.
+ * Persistent user settings for ElowbeAgent ({@code ~/.elowbe-agent/settings.json}).
  */
 public final class AgentSettings {
 	private static final File SETTINGS_DIR = new File(System.getProperty("user.home"), ".elowbe-agent");
 	private static final File SETTINGS_FILE = new File(SETTINGS_DIR, "settings.json");
 
+	private static final String DEFAULT_AGENT_MODEL = "lmstudio:qwen3.6-27b-mtp";
+	private static final String DEFAULT_AGENT_BROWSER_COMMAND = "agent-browser --json";
+	private static final int DEFAULT_AGENT_MAX_OUTPUT_TOKENS = 32000;
+
 	private File projectsDirectory;
+	private String agentModel = DEFAULT_AGENT_MODEL;
+	private boolean thinkingEnabled = true;
+	private boolean subtasksEnabled = false;
+	private boolean agentBrowserWebEnabled = true;
+	private String agentBrowserCommand = DEFAULT_AGENT_BROWSER_COMMAND;
+	private int agentContextLength;
+	private int agentMaxOutputTokens = DEFAULT_AGENT_MAX_OUTPUT_TOKENS;
+	private List<String> manualSkillIds = List.of();
 
 	private AgentSettings(File projectsDirectory) {
 		this.projectsDirectory = projectsDirectory;
@@ -25,31 +40,75 @@ public final class AgentSettings {
 	}
 
 	public static AgentSettings load() {
+		AgentSettings settings = new AgentSettings(defaultProjectsDirectory());
 		if (!SETTINGS_FILE.isFile()) {
-			return new AgentSettings(defaultProjectsDirectory());
+			return settings;
 		}
 		try {
 			String raw = Files.readString(SETTINGS_FILE.toPath(), StandardCharsets.UTF_8);
 			JSONObject json = new JSONObject(raw);
 			String path = json.optString("projectsDirectory", "");
-			File projectsDirectory = path.isBlank() ? defaultProjectsDirectory()
+			settings.projectsDirectory = path.isBlank() ? defaultProjectsDirectory()
 					: new File(path).getAbsoluteFile();
-			return new AgentSettings(projectsDirectory);
+			settings.agentModel = json.optString("agentModel", DEFAULT_AGENT_MODEL);
+			settings.thinkingEnabled = json.optBoolean("thinkingEnabled", true);
+			settings.subtasksEnabled = json.optBoolean("subtasksEnabled", false);
+			settings.agentBrowserWebEnabled = json.optBoolean("agentBrowserWebEnabled", true);
+			settings.agentBrowserCommand = json.optString("agentBrowserCommand", DEFAULT_AGENT_BROWSER_COMMAND);
+			settings.agentContextLength = json.optInt("agentContextLength", 0);
+			settings.agentMaxOutputTokens = json.optInt("agentMaxOutputTokens", DEFAULT_AGENT_MAX_OUTPUT_TOKENS);
+			settings.manualSkillIds = parseSkillIds(json.optJSONArray("manualSkillIds"));
+			return settings;
 		} catch (Exception e) {
 			return new AgentSettings(defaultProjectsDirectory());
 		}
+	}
+
+	private static List<String> parseSkillIds(JSONArray array) {
+		if (array == null || array.isEmpty()) {
+			return List.of();
+		}
+		List<String> ids = new ArrayList<>();
+		for (int i = 0; i < array.length(); i++) {
+			String id = array.optString(i, "").trim();
+			if (!id.isEmpty()) {
+				ids.add(id);
+			}
+		}
+		return List.copyOf(ids);
+	}
+
+	public void applyTo(ElowbeAgent agent) {
+		agent.setAgentModel(agentModel);
+		agent.setThinkingEnabled(thinkingEnabled);
+		agent.setSubtasksEnabled(subtasksEnabled);
+		agent.setAgentBrowserWebEnabled(agentBrowserWebEnabled);
+		agent.setAgentBrowserCommand(agentBrowserCommand);
+		agent.setAgentContextLength(agentContextLength);
+		agent.setAgentMaxOutputTokens(agentMaxOutputTokens);
+		agent.setPersistedManualSkillIds(manualSkillIds);
+	}
+
+	public void captureFrom(ElowbeAgent agent) {
+		agentModel = agent.getAgentModel();
+		thinkingEnabled = agent.isThinkingEnabled();
+		subtasksEnabled = agent.isSubtasksEnabled();
+		agentBrowserWebEnabled = agent.isAgentBrowserWebEnabled();
+		agentBrowserCommand = agent.getAgentBrowserCommand();
+		agentContextLength = agent.getAgentContextLength();
+		agentMaxOutputTokens = agent.getAgentMaxOutputTokens();
+		manualSkillIds = List.copyOf(agent.getManualSkillIds());
 	}
 
 	public File getProjectsDirectory() {
 		return projectsDirectory;
 	}
 
-	public void setProjectsDirectory(File projectsDirectory) throws IOException {
+	public void setProjectsDirectory(File projectsDirectory) {
 		if (projectsDirectory == null) {
-			throw new IOException("Projects directory cannot be null");
+			throw new IllegalArgumentException("Projects directory cannot be null");
 		}
 		this.projectsDirectory = projectsDirectory.getAbsoluteFile();
-		save();
 	}
 
 	public File ensureProjectsDirectory() throws IOException {
@@ -84,12 +143,28 @@ public final class AgentSettings {
 		}
 	}
 
-	private void save() throws IOException {
+	public void save() throws IOException {
 		if (!SETTINGS_DIR.exists() && !SETTINGS_DIR.mkdirs()) {
 			throw new IOException("Could not create settings directory: " + SETTINGS_DIR.getPath());
 		}
 		JSONObject json = new JSONObject();
 		json.put("projectsDirectory", projectsDirectory.getAbsolutePath());
+		json.put("agentModel", agentModel);
+		json.put("thinkingEnabled", thinkingEnabled);
+		json.put("subtasksEnabled", subtasksEnabled);
+		json.put("agentBrowserWebEnabled", agentBrowserWebEnabled);
+		json.put("agentBrowserCommand", agentBrowserCommand);
+		json.put("agentContextLength", agentContextLength);
+		json.put("agentMaxOutputTokens", agentMaxOutputTokens);
+		JSONArray skillIds = new JSONArray();
+		for (String id : manualSkillIds) {
+			skillIds.put(id);
+		}
+		json.put("manualSkillIds", skillIds);
 		Files.writeString(SETTINGS_FILE.toPath(), json.toString(2), StandardCharsets.UTF_8);
+	}
+
+	public static File getSettingsFile() {
+		return SETTINGS_FILE;
 	}
 }

@@ -348,9 +348,10 @@ public class ToolChoiceSchema {
 		JSONObject plugin = object();
 		plugin.put("additionalProperties", false);
 		plugin.put("properties", new JSONObject()
-				.put("group_id", stringProperty("Plugin groupId. Defaults to org.apache.maven.plugins."))
+				.put("group_id", stringProperty("Plugin groupId. Defaults to org.apache.maven.plugins; exec-maven-plugin uses org.codehaus.mojo; javafx-maven-plugin uses org.openjfx."))
 				.put("artifact_id", stringProperty("Plugin artifactId."))
 				.put("version", stringProperty("Plugin version."))
+				.put("main_class", stringProperty("Preferred for exec-maven-plugin/javafx-maven-plugin. Sets <mainClass> without XML."))
 				.put("configuration", stringProperty("Optional inner XML placed under <configuration>."))
 				.put("executions", new JSONObject()
 						.put("type", "array")

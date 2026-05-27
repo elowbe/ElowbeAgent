@@ -8,6 +8,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Locale;
 import java.util.function.BooleanSupplier;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import org.json.JSONArray;
 import org.json.JSONException;
@@ -27,13 +29,21 @@ public class AgentRunner {
 	private static final int MAX_SUBTASK_DEPTH = 1;
 	private static final int MAX_SUBTASK_WORKER_TOOLS = 1;
 	private static final int MAX_SUBTASK_RESULT_CHARS = 40_000;
+	private static final Pattern TOOL_RESULT_MESSAGE = Pattern.compile(
+			"Tool \"([^\"]+)\" finished\\..*?\\n\\nArguments:\\n(.*)\\n\\nResult:\\n(.*)",
+			Pattern.DOTALL);
 	private static final BooleanSupplier NEVER_CANCEL = () -> false;
 	private static final String RUN_SCRIPT_UNIX = """
 			#!/usr/bin/env bash
 			set -euo pipefail
 
 			if [ -f "pom.xml" ]; then
-			  mvn -q -DskipTests compile exec:java
+			  MAIN=$(sed -n 's:.*<mainClass>\\([^<]*\\)</mainClass>.*:\\1:p' pom.xml | head -1 | tr -d '[:space:]')
+			  if [ -n "$MAIN" ]; then
+			    mvn -q -DskipTests compile -Dexec.mainClass="$MAIN" org.codehaus.mojo:exec-maven-plugin:java
+			  else
+			    mvn -q -DskipTests compile exec:java
+			  fi
 			elif [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
 			  ./gradlew run
 			elif [ -f "package.json" ]; then
@@ -48,7 +58,13 @@ public class AgentRunner {
 			setlocal
 
 			if exist pom.xml (
+			  set MAIN=
+			  for /f "tokens=2 delims=<>" %%A in ('findstr /R "<mainClass>.*</mainClass>" pom.xml') do set MAIN=%%A
+			  if defined MAIN goto run_with_main
 			  call mvn -q -DskipTests compile exec:java
+			  goto :eof
+			  :run_with_main
+			  call mvn -q -DskipTests compile -Dexec.mainClass=%MAIN% org.codehaus.mojo:exec-maven-plugin:java
 			  goto :eof
 			)
 			if exist build.gradle (
@@ -125,6 +141,11 @@ public class AgentRunner {
 		void accept(JSONObject usage);
 	}
 
+	@FunctionalInterface
+	public interface HistoryCompactor {
+		void compact(JSONArray messages) throws IOException;
+	}
+
 	private AgentRunner() {
 	}
 
@@ -154,8 +175,15 @@ public class AgentRunner {
 	public static void run(JSONArray messages, File workingDirectory, TokenSink tokenSink,
 			ThinkingSink thinkingSink, ToolSink toolSink, UsageSink usageSink, BooleanSupplier cancelRequested,
 			boolean thinkingEnabled, boolean subtasksEnabled) throws IOException {
+		run(messages, workingDirectory, tokenSink, thinkingSink, toolSink, usageSink, cancelRequested,
+				thinkingEnabled, subtasksEnabled, null);
+	}
+
+	public static void run(JSONArray messages, File workingDirectory, TokenSink tokenSink,
+			ThinkingSink thinkingSink, ToolSink toolSink, UsageSink usageSink, BooleanSupplier cancelRequested,
+			boolean thinkingEnabled, boolean subtasksEnabled, HistoryCompactor historyCompactor) throws IOException {
 		run(messages, workingDirectory, tokenSink, thinkingSink, toolSink, usageSink, cancelRequested, 0,
-				thinkingEnabled, subtasksEnabled);
+				thinkingEnabled, subtasksEnabled, historyCompactor);
 	}
 
 	public static String runSubtask(String task, String context, File workingDirectory, BooleanSupplier cancelRequested)
@@ -187,14 +215,14 @@ public class AgentRunner {
 
 		StringBuilder result = new StringBuilder();
 		run(messages, workingDirectory, result::append, thinkingSink, toolSink, usageSink, cancelRequested,
-				MAX_SUBTASK_DEPTH, OllamaAPI.thinkingEnabled, true);
+				MAX_SUBTASK_DEPTH, OllamaAPI.thinkingEnabled, true, null);
 		String text = result.toString().trim();
 		return text.isBlank() ? "Subtask finished without a final response." : text;
 	}
 
 	private static void run(JSONArray messages, File workingDirectory, TokenSink tokenSink,
 			ThinkingSink thinkingSink, ToolSink toolSink, UsageSink usageSink, BooleanSupplier cancelRequested,
-			int subtaskDepth, boolean thinkingEnabled, boolean subtasksEnabled)
+			int subtaskDepth, boolean thinkingEnabled, boolean subtasksEnabled, HistoryCompactor historyCompactor)
 			throws IOException {
 		if (cancelRequested == null) {
 			cancelRequested = NEVER_CANCEL;
@@ -212,6 +240,7 @@ public class AgentRunner {
 
 		for (int turn = 0; turn < MAX_TURNS; turn++) {
 			throwIfCancelled(cancelRequested);
+			compactHistoryIfNeeded(messages, historyCompactor, cancelRequested);
 			if (subtaskDepth > 0 && thinkingSink != null) {
 				thinkingSink.accept("Subtask worker turn " + (turn + 1) + " started\n");
 			}
@@ -226,8 +255,6 @@ public class AgentRunner {
 								if (thinkingSink != null) {
 									thinkingSink.accept(prefixSubtaskOutput(token));
 								}
-							} else if (tokenSink != null) {
-								tokenSink.accept(token);
 							}
 						}
 
@@ -238,8 +265,6 @@ public class AgentRunner {
 							}
 							if (subtaskDepth > 0) {
 								thinkingSink.accept(prefixSubtaskOutput(token));
-							} else {
-								thinkingSink.accept(token);
 							}
 						}
 
@@ -266,6 +291,7 @@ public class AgentRunner {
 			stepRetryStreak = 0;
 			normalizeAssistantMessageContent(assistantMessage, thinkingEnabled);
 			messages.put(assistantMessage);
+			compactHistoryIfNeeded(messages, historyCompactor, cancelRequested);
 
 			emitStepThinking(step, thinkingSink, loopState);
 
@@ -315,6 +341,7 @@ public class AgentRunner {
 					toolSink.accept(name, arguments, result.getOutput());
 				}
 				appendToolResult(messages, name, arguments, result.getOutput());
+				compactHistoryIfNeeded(messages, historyCompactor, cancelRequested);
 				guard.observe(name, arguments, result.getOutput());
 				if (delegationGuard != null) {
 					delegationGuard.observe(name, result.getOutput(), messages);
@@ -486,6 +513,40 @@ public class AgentRunner {
 			yield "→ " + name;
 		}
 		};
+	}
+
+	/** Compact user message for persisted chat history (tool call line + result summary only). */
+	public static JSONObject compactToolHistoryEntry(String toolName, JSONObject arguments, String result) {
+		String name = toolName == null ? "" : toolName;
+		JSONObject args = arguments == null ? new JSONObject() : arguments;
+		String action = formatToolAction(name, args);
+		String summary = formatToolResultSummary(name, result);
+		String content = "Tool call: " + action + "\nTool result: " + summary;
+		return new JSONObject().put("role", "user").put("content", content);
+	}
+
+	/**
+	 * Parses a full in-run tool result user message and returns a compact history entry,
+	 * or null if the content is not a tool result message.
+	 */
+	public static JSONObject compactToolResultMessage(String content) {
+		if (content == null || content.isBlank()) {
+			return null;
+		}
+		Matcher matcher = TOOL_RESULT_MESSAGE.matcher(content.trim());
+		if (!matcher.matches()) {
+			return null;
+		}
+		String toolName = matcher.group(1);
+		String argumentText = matcher.group(2).trim();
+		String resultText = matcher.group(3);
+		JSONObject arguments;
+		try {
+			arguments = new JSONObject(argumentText);
+		} catch (JSONException e) {
+			arguments = new JSONObject().put("raw_arguments", argumentText);
+		}
+		return compactToolHistoryEntry(toolName, arguments, resultText);
 	}
 
 	/** Concise summary of a tool result for console logging (no file/command dumps). */
@@ -707,10 +768,6 @@ public class AgentRunner {
 								if (thinkingSink != null) {
 									thinkingSink.accept(prefixSubtaskOutput(token));
 								}
-							} else if (thinkingSink != null) {
-								thinkingSink.accept(token);
-							} else if (tokenSink != null) {
-								tokenSink.accept(token);
 							}
 						}
 
@@ -721,8 +778,6 @@ public class AgentRunner {
 							}
 							if (subtaskDepth > 0) {
 								thinkingSink.accept(prefixSubtaskOutput(token));
-							} else {
-								thinkingSink.accept(token);
 							}
 						}
 
@@ -1107,6 +1162,11 @@ public class AgentRunner {
 		if (loopState.shouldSuppressThinking(step)) {
 			return;
 		}
+		String thinking = step.optString("thinking", "");
+		if (!thinking.isBlank()) {
+			thinkingSink.accept(thinking + "\n");
+			return;
+		}
 		String thought = step.optString("thought", "");
 		String plan = step.optString("plan", "");
 		if (!thought.isBlank()) {
@@ -1274,6 +1334,16 @@ public class AgentRunner {
 		for (int i = messages.length() - 1; i >= startIndex; i--) {
 			messages.remove(i);
 		}
+	}
+
+	private static void compactHistoryIfNeeded(JSONArray messages, HistoryCompactor historyCompactor,
+			BooleanSupplier cancelRequested) throws IOException {
+		if (historyCompactor == null) {
+			return;
+		}
+		throwIfCancelled(cancelRequested);
+		historyCompactor.compact(messages);
+		throwIfCancelled(cancelRequested);
 	}
 
 	private static void throwIfCancelled(BooleanSupplier cancelRequested) throws InterruptedIOException {

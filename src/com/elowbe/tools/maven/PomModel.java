@@ -199,6 +199,10 @@ public final class PomModel {
 				if (!version.isBlank()) {
 					summary.append(':').append(version);
 				}
+				String configSummary = summarizePluginConfiguration(plugin);
+				if (!configSummary.isBlank()) {
+					summary.append(' ').append(configSummary);
+				}
 				summary.append('\n');
 			}
 		} else {
@@ -268,11 +272,14 @@ public final class PomModel {
 		if (spec.artifactId().isBlank()) {
 			throw new IOException("plugin artifact_id is required");
 		}
-		String groupId = spec.groupId().isBlank() ? "org.apache.maven.plugins" : spec.groupId();
+		String groupId = resolvePluginGroupId(spec.artifactId(), spec.groupId());
 
 		Element build = ensureChild(document, project, "build");
 		Element plugins = ensureChild(document, build, "plugins");
 		Element existing = findPlugin(plugins, groupId, spec.artifactId());
+		if (existing == null) {
+			existing = findPluginByArtifactId(plugins, spec.artifactId());
+		}
 		Element plugin = existing == null ? document.createElementNS(POM_NS, "plugin") : existing;
 		if (existing == null) {
 			plugins.appendChild(plugin);
@@ -294,13 +301,120 @@ public final class PomModel {
 		if (plugins == null) {
 			return false;
 		}
-		String resolvedGroup = groupId == null || groupId.isBlank() ? "org.apache.maven.plugins" : groupId;
+		String resolvedGroup = resolvePluginGroupId(artifactId, groupId);
 		Element existing = findPlugin(plugins, resolvedGroup, artifactId);
+		if (existing == null) {
+			existing = findPluginByArtifactId(plugins, artifactId);
+		}
 		if (existing == null) {
 			return false;
 		}
 		plugins.removeChild(existing);
 		return true;
+	}
+
+	public int repairMisconfiguredPlugins() {
+		Element build = child(project, "build");
+		Element plugins = build == null ? null : child(build, "plugins");
+		if (plugins == null) {
+			return 0;
+		}
+		int repairs = 0;
+		for (Element plugin : childElements(plugins, "plugin")) {
+			String artifactId = childText(plugin, "artifactId");
+			String groupId = childText(plugin, "groupId");
+			String corrected = resolvePluginGroupId(artifactId, groupId);
+			if (!corrected.equals(groupId)) {
+				setChildText(plugin, "groupId", corrected);
+				repairs++;
+			}
+		}
+		return repairs;
+	}
+
+	public String execMainClass() {
+		Element build = child(project, "build");
+		Element plugins = build == null ? null : child(build, "plugins");
+		if (plugins == null) {
+			return "";
+		}
+		for (Element plugin : childElements(plugins, "plugin")) {
+			if (!"exec-maven-plugin".equals(childText(plugin, "artifactId"))) {
+				continue;
+			}
+			String mainClass = readExecMainClass(plugin);
+			if (!mainClass.isBlank()) {
+				return mainClass;
+			}
+		}
+		return "";
+	}
+
+	public boolean hasExecMavenPlugin() {
+		Element build = child(project, "build");
+		Element plugins = build == null ? null : child(build, "plugins");
+		if (plugins == null) {
+			return false;
+		}
+		for (Element plugin : childElements(plugins, "plugin")) {
+			if ("exec-maven-plugin".equals(childText(plugin, "artifactId"))) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public boolean ensureExecMainClass(String mainClass) throws IOException {
+		if (mainClass == null || mainClass.isBlank()) {
+			return false;
+		}
+		Element build = ensureChild(document, project, "build");
+		Element plugins = ensureChild(document, build, "plugins");
+		Element plugin = findPluginByArtifactId(plugins, "exec-maven-plugin");
+		if (plugin == null) {
+			return false;
+		}
+		if (!readExecMainClass(plugin).isBlank()) {
+			return false;
+		}
+		replaceConfiguration(plugin, "<mainClass>" + mainClass.trim() + "</mainClass>");
+		return true;
+	}
+
+	private static String readExecMainClass(Element plugin) {
+		Element configuration = childDirect(plugin, "configuration");
+		if (configuration == null) {
+			return "";
+		}
+		return childText(configuration, "mainClass");
+	}
+
+	private static String summarizePluginConfiguration(Element plugin) {
+		String artifactId = childText(plugin, "artifactId");
+		if ("exec-maven-plugin".equals(artifactId)) {
+			String mainClass = readExecMainClass(plugin);
+			return mainClass.isBlank() ? "(mainClass not set)" : "mainClass=" + mainClass;
+		}
+		if ("javafx-maven-plugin".equals(artifactId)) {
+			Element configuration = childDirect(plugin, "configuration");
+			if (configuration == null) {
+				return "(mainClass not set)";
+			}
+			String mainClass = childText(configuration, "mainClass");
+			return mainClass.isBlank() ? "(mainClass not set)" : "mainClass=" + mainClass;
+		}
+		return "";
+	}
+
+	public static String resolvePluginGroupId(String artifactId, String groupId) {
+		if (artifactId == null || artifactId.isBlank()) {
+			return groupId == null || groupId.isBlank() ? "org.apache.maven.plugins" : groupId.trim();
+		}
+		return switch (artifactId.trim()) {
+		case "exec-maven-plugin" -> "org.codehaus.mojo";
+		case "javafx-maven-plugin" -> "org.openjfx";
+		default -> groupId == null || groupId.isBlank() ? "org.apache.maven.plugins" : groupId.trim();
+		};
 	}
 
 	private void replaceConfiguration(Element plugin, String configurationXml) throws IOException {
@@ -368,6 +482,15 @@ public final class PomModel {
 		for (Element plugin : childElements(plugins, "plugin")) {
 			if (groupId.equals(childText(plugin, "groupId"))
 					&& artifactId.equals(childText(plugin, "artifactId"))) {
+				return plugin;
+			}
+		}
+		return null;
+	}
+
+	private Element findPluginByArtifactId(Element plugins, String artifactId) {
+		for (Element plugin : childElements(plugins, "plugin")) {
+			if (artifactId.equals(childText(plugin, "artifactId"))) {
 				return plugin;
 			}
 		}

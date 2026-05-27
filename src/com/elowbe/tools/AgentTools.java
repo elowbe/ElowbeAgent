@@ -254,6 +254,9 @@ public class AgentTools {
 		if (AgentSettings.load().isProjectsRoot(workingDirectory)) {
 			return ToolResult.output("run: open a project first; run.sh/run.bat cannot be used in the projects folder");
 		}
+		if (workingDirectory != null && new File(workingDirectory, "pom.xml").isFile()) {
+			MavenTool.prepareExecJavaProject(workingDirectory);
+		}
 		String command = first(arguments, "command", "cmd");
 		if (command.isBlank()) {
 			String os = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);

@@ -47,22 +47,33 @@ public class ElowbeAgent extends JinCanvas {
 			Workers run one action tool and terminate; break multi-step work into separate subtask calls.
 			""";
 
-	/** LLM model used for non-slash agent instructions (Ollama name or lmstudio: / claude: prefix). */
+	/**
+	 * LLM model used for non-slash agent instructions (Ollama name or lmstudio: /
+	 * claude: prefix).
+	 */
 	private static String agentModel = "lmstudio:qwen3.6-27b-mtp";
 	private static String ollamaUrl = "http://10.0.0.8:11434";
-	/** LM Studio OpenAI-compatible API base URL (local server default port 1234). */
+	/**
+	 * LM Studio OpenAI-compatible API base URL (local server default port 1234).
+	 */
 	private static String lmstudioUrl = "http://10.0.0.8:1234/v1";
-	/** Context window for LLM calls (Ollama {@code num_ctx}, LM Studio {@code context_length}); {@code 0} = server default. */
+	/**
+	 * Context window for LLM calls (Ollama {@code num_ctx}, LM Studio
+	 * {@code context_length}); {@code 0} = server default.
+	 */
 	private static int agentContextLength = 0;
 	/** Maximum tokens generated per LLM response; {@code 0} = server default. */
 	private static int agentMaxOutputTokens = 32000;
 	/**
-	 * When false, thinking/reasoning tokens are not shown and the thinking channel is not used as model output.
+	 * When false, thinking/reasoning tokens are not shown and the thinking channel
+	 * is not used as model output.
 	 */
 	private boolean thinkingEnabled = true;
 	/** When false, the subtask tool and delegation guard are disabled. */
-	private boolean subtasksEnabled = true;
-	/** When true, the web tool uses Vercel's agent-browser CLI instead of Selenium. */
+	private boolean subtasksEnabled = false;
+	/**
+	 * When true, the web tool uses Vercel's agent-browser CLI instead of Selenium.
+	 */
 	private boolean agentBrowserWebEnabled = true;
 	/** Base command used to invoke Vercel's agent-browser CLI. */
 	private String agentBrowserCommand = "agent-browser --json";
@@ -78,6 +89,7 @@ public class ElowbeAgent extends JinCanvas {
 	private final List<Skill> discoveredSkills = new ArrayList<>();
 	/** Skills chosen for the current agent run (set before each run). */
 	private List<Skill> selectedSkillsForRun = List.of();
+	private List<String> manualSkillIds = List.of();
 	/** Diagnostic when skill selection yields none (for console display). */
 	private String lastSkillSelectionNote;
 	private final JSONArray chatHistory = new JSONArray();
@@ -95,6 +107,7 @@ public class ElowbeAgent extends JinCanvas {
 	private final AtomicBoolean agentCancelRequested = new AtomicBoolean();
 	private volatile Thread agentThread;
 	private OptionsWidget modelPickerWidget;
+	private SkillMultiSelectWidget skillPickerWidget;
 	private boolean controlHeld;
 	private boolean spaceHeld;
 	/** Photos dropped onto the window, sent with the next agent message. */
@@ -103,7 +116,12 @@ public class ElowbeAgent extends JinCanvas {
 	private List<FileChange> pendingReviewChanges = new ArrayList<>();
 	private int reviewIndex;
 	private int acceptedReviewCount;
+	private boolean awaitingCommitMessage;
+	private boolean awaitingCommitDescription;
+	private String pendingCommitSubject;
 	private AgentSettings agentSettings;
+	/** Suppresses settings persistence while applying values loaded from disk. */
+	private boolean applyingPersistedSettings;
 	private OptionsWidget newProjectPickerWidget;
 	private OptionsWidget projectPickerWidget;
 	private File[] listedProjects = new File[0];
@@ -142,6 +160,12 @@ public class ElowbeAgent extends JinCanvas {
 
 		loadSystemPrompt();
 		agentSettings = AgentSettings.load();
+		applyingPersistedSettings = true;
+		try {
+			agentSettings.applyTo(this);
+		} finally {
+			applyingPersistedSettings = false;
+		}
 		configureWebTool();
 		try {
 			directory = agentSettings.ensureProjectsDirectory();
@@ -236,13 +260,13 @@ public class ElowbeAgent extends JinCanvas {
 		content.append("- Current directory: ").append(profile.currentDirectoryPath()).append('\n');
 		content.append(
 				"- Java and Maven are the default stack unless the user explicitly requested another language, build tool, or framework.\n");
-		content.append(
-				"- ALWAYS use the maven tool (not bash mvn, not write/edit) for pom.xml and Maven builds.\n");
+		content.append("- ALWAYS use the maven tool (not bash mvn, not write/edit) for pom.xml and Maven builds.\n");
 		content.append(
 				"- Prefer the web tool over bash for web-based tasks: loading pages, following links, captcha-resistant web searches, browser-context API tests, and browser-observable HTTP behavior. Use bash for web work only when the web tool cannot express the task.\n");
-		content.append("- Web tool backend: ").append(agentBrowserWebEnabled
-				? "Vercel agent-browser CLI via `" + agentBrowserCommand + "`."
-				: "Selenium browser automation.").append('\n');
+		content.append("- Web tool backend: ")
+				.append(agentBrowserWebEnabled ? "Vercel agent-browser CLI via `" + agentBrowserCommand + "`."
+						: "Selenium browser automation.")
+				.append('\n');
 		content.append("- Application type guidance: ").append(profile.frameworkGuidance).append('\n');
 		if (profile.mavenProjectRoot == null) {
 			content.append(
@@ -282,6 +306,74 @@ public class ElowbeAgent extends JinCanvas {
 		return request;
 	}
 
+	private int protectedChatPrefixCount(JSONArray messages) {
+		if (messages == null || messages.length() == 0) {
+			return 0;
+		}
+		JSONObject first = messages.optJSONObject(0);
+		if (first == null || !"system".equals(first.optString("role"))) {
+			return 0;
+		}
+		// The leading system message includes the selected skill supplements for this
+		// run, so it must remain verbatim and outside persisted chat history.
+		return 1;
+	}
+
+	/**
+	 * Keeps user instructions and compact tool call/result entries only. Drops assistant
+	 * planning/argument messages and internal loop instructions so large tool payloads
+	 * (file contents, command output, etc.) are not re-sent on later turns.
+	 */
+	private JSONArray compactChatHistoryForLlm(JSONArray messages) {
+		JSONArray compact = new JSONArray();
+		if (messages == null) {
+			return compact;
+		}
+		for (int i = 0; i < messages.length(); i++) {
+			JSONObject message = messages.optJSONObject(i);
+			if (message == null) {
+				continue;
+			}
+			String role = message.optString("role", "");
+			if ("assistant".equals(role)) {
+				continue;
+			}
+			if (!"user".equals(role)) {
+				compact.put(message);
+				continue;
+			}
+			String content = message.optString("content", "");
+			if (isPersistedUserInstruction(content)) {
+				compact.put(message);
+				continue;
+			}
+			JSONObject compactTool = AgentRunner.compactToolResultMessage(content);
+			if (compactTool != null) {
+				compact.put(compactTool);
+			}
+		}
+		return compact;
+	}
+
+	private static boolean isPersistedUserInstruction(String content) {
+		if (content == null || content.isBlank()) {
+			return false;
+		}
+		return content.contains("User request:\n") || content.contains("Runtime project preflight from ElowbeAgent:");
+	}
+
+	private void syncChatHistoryFromRequest(JSONArray request, int protectedPrefixCount) {
+		chatHistory.clear();
+		JSONArray sessionMessages = new JSONArray();
+		for (int i = protectedPrefixCount; i < request.length(); i++) {
+			sessionMessages.put(request.get(i));
+		}
+		JSONArray compact = compactChatHistoryForLlm(sessionMessages);
+		for (int i = 0; i < compact.length(); i++) {
+			chatHistory.put(compact.get(i));
+		}
+	}
+
 	private String buildResolvedSystemPrompt() {
 		StringBuilder resolved = new StringBuilder();
 		if (systemPrompt != null && !systemPrompt.isBlank()) {
@@ -315,8 +407,8 @@ public class ElowbeAgent extends JinCanvas {
 			try {
 				resolved.append('\n').append(Skill.formatSkillSupplement(skill));
 			} catch (IOException e) {
-				resolved.append("\n### ").append(skill.name).append("\n(load failed: ")
-						.append(e.getMessage()).append(")\n");
+				resolved.append("\n### ").append(skill.name).append("\n(load failed: ").append(e.getMessage())
+						.append(")\n");
 			}
 		}
 		resolved.append(
@@ -345,6 +437,14 @@ public class ElowbeAgent extends JinCanvas {
 
 	public void runCommand(String line) {
 		line = line == null ? "" : line.trim();
+		if (awaitingCommitMessage) {
+			handleCommitMessageInput(line);
+			return;
+		}
+		if (awaitingCommitDescription) {
+			handleCommitDescriptionInput(line);
+			return;
+		}
 		if (line.isEmpty() && attachedPhotos.isEmpty()) {
 			return;
 		}
@@ -533,6 +633,13 @@ public class ElowbeAgent extends JinCanvas {
 		sendAgentInstruction(instruction, new JSONArray());
 	}
 
+	public void changeBarColor() {
+		if (t < 0) {
+			targetColor = Colors.randomColorFromSeed("" + Math.random() * 1000000L, .95f, 1f);
+			t = 0;
+		}
+	}
+
 	private void sendAgentInstruction(String instruction, JSONArray images) {
 		if (agentBusy) {
 			printWidget.println("Agent is still responding. Please wait.");
@@ -557,34 +664,48 @@ public class ElowbeAgent extends JinCanvas {
 			try {
 				selectedSkillsForRun = List.of();
 				lastSkillSelectionNote = null;
-				List<Skill> skillCandidates = collectSkillCandidates();
 				printWidget.setColor(Colors.lightgray);
-				if (skillCandidates.isEmpty()) {
-					printWidget.println("Skill selection: no skills found on disk");
-					File agentHome = Skill.resolveAgentHomeDirectory();
-					if (agentHome != null) {
-						printWidget.println("  agent home: " + agentHome.getPath());
-					}
-					for (File root : Skill.skillDirectoryRootsForAgent(directory)) {
-						printWidget.println("  searched: " + root.getPath()
-								+ (root.isDirectory() ? "" : " (missing)"));
+				if (!manualSkillIds.isEmpty()) {
+					List<Skill> skillCandidates = collectSkillCandidates();
+					selectedSkillsForRun = SkillSelector.resolveReferences(manualSkillIds, skillCandidates,
+							directory);
+					if (selectedSkillsForRun.isEmpty()) {
+						printWidget.println("Skill selection: manual skills not found on disk");
+						for (String id : manualSkillIds) {
+							printWidget.println("  missing: " + id);
+						}
+					} else {
+						printWidget.println("Skill selection: using manually selected skills ("
+								+ selectedSkillsForRun.size() + ")");
 					}
 				} else {
-					printWidget.println("Skill selection: asking LLM (" + skillCandidates.size() + " candidates)...");
-					try {
-						SkillSelector.SkillSelectionResult selection = SkillSelector.select(instruction,
-								skillCandidates, directory,
-								() -> agentCancelRequested.get() || Thread.currentThread().isInterrupted(),
-								this::addAgentTokenUsage, thinkingEnabled);
-						selectedSkillsForRun = selection.skills();
-						lastSkillSelectionNote = selection.note();
-					} catch (IOException e) {
-						if (agentCancelRequested.get() || Thread.currentThread().isInterrupted()) {
-							throw e;
+					List<Skill> skillCandidates = collectSkillCandidates();
+					if (skillCandidates.isEmpty()) {
+						printWidget.println("Skill selection: no skills found on disk");
+						File agentHome = Skill.resolveAgentHomeDirectory();
+						if (agentHome != null) {
+							printWidget.println("  agent home: " + agentHome.getPath());
 						}
-						lastSkillSelectionNote = e.getMessage();
-						printWidget.println("Skill selection failed: " + e.getMessage()
-								+ " (continuing without skills)");
+						for (File root : Skill.skillDirectoryRootsForAgent(directory)) {
+							printWidget.println("  searched: " + root.getPath() + (root.isDirectory() ? "" : " (missing)"));
+						}
+					} else {
+						printWidget.println("Skill selection: asking LLM (" + skillCandidates.size() + " candidates)...");
+						try {
+							SkillSelector.SkillSelectionResult selection = SkillSelector.select(instruction,
+									skillCandidates, directory,
+									() -> agentCancelRequested.get() || Thread.currentThread().isInterrupted(),
+									this::addAgentTokenUsage, thinkingEnabled);
+							selectedSkillsForRun = selection.skills();
+							lastSkillSelectionNote = selection.note();
+						} catch (IOException e) {
+							if (agentCancelRequested.get() || Thread.currentThread().isInterrupted()) {
+								throw e;
+							}
+							lastSkillSelectionNote = e.getMessage();
+							printWidget
+									.println("Skill selection failed: " + e.getMessage() + " (continuing without skills)");
+						}
 					}
 				}
 				if (agentCancelRequested.get() || Thread.currentThread().isInterrupted()) {
@@ -595,35 +716,27 @@ public class ElowbeAgent extends JinCanvas {
 				logSkillSelection();
 
 				JSONArray request = buildChatRequest(userMessage);
-				int turnStart = request.length() - 1;
+				int protectedPrefixCount = protectedChatPrefixCount(request);
 
 				printWidget.print("<#green>");
 				printWidget.setColor(Colors.green);
 				configureWebTool();
 				AgentRunner.run(request, directory, token -> {
-					if (!subtaskActive) {
-						printWidget.setColor(Colors.green);
-						printWidget.print(token);
-					}
-					if(t < 0) {
-						targetColor = Colors.randomColorFromSeed("" + Math.random() * 1000000L, .95f, 1f);
-						t=0;
-					}
-				}, thinkingEnabled ? thinking -> {
+					changeBarColor();
 					if (t < 0) {
 						targetColor = Colors.randomColorFromSeed("" + Math.random() * 1000000L, .95f, 1f);
 						t = 0;
 					}
-//					printWidget.setColor(subtaskActive ? Colors.darkblue : Colors.lightgray);
-//					printWidget.print(thinking);
+				}, thinkingEnabled ? thinking -> {
+					changeBarColor();
+					printWidget.setColor(subtaskActive ? Colors.darkblue : Colors.lightgray);
+					printWidget.print(thinking);
 				} : null, (name, args, result) -> logToolActivity(name, args, result), this::addAgentTokenUsage,
 						() -> agentCancelRequested.get() || Thread.currentThread().isInterrupted(), thinkingEnabled,
 						subtasksEnabled);
-
+				changeBarColor();
 				if (!agentCancelRequested.get()) {
-					for (int i = turnStart; i < request.length(); i++) {
-						chatHistory.put(request.get(i));
-					}
+					syncChatHistoryFromRequest(request, protectedPrefixCount);
 					printWidget.println();
 					ensureGitRepository(false);
 					printWidget.setColor(Colors.lightblue);
@@ -686,7 +799,7 @@ public class ElowbeAgent extends JinCanvas {
 
 	private String formatSelectedSkillsStatus() {
 		if (selectedSkillsForRun.isEmpty()) {
-			return "";
+			return formatManualSkillsStatus();
 		}
 		StringBuilder status = new StringBuilder(" | skills: ");
 		for (int i = 0; i < selectedSkillsForRun.size(); i++) {
@@ -694,6 +807,25 @@ public class ElowbeAgent extends JinCanvas {
 				status.append(", ");
 			}
 			status.append(selectedSkillsForRun.get(i).learnCatalogPath(directory));
+		}
+		String text = status.toString();
+		int max = Math.max(20, JinConsole.getColumns() - 8);
+		if (text.length() > max) {
+			return text.substring(0, max - 3) + "...";
+		}
+		return text;
+	}
+
+	private String formatManualSkillsStatus() {
+		if (manualSkillIds.isEmpty()) {
+			return "";
+		}
+		StringBuilder status = new StringBuilder(" | manual skills: ");
+		for (int i = 0; i < manualSkillIds.size(); i++) {
+			if (i > 0) {
+				status.append(", ");
+			}
+			status.append(manualSkillIds.get(i));
 		}
 		String text = status.toString();
 		int max = Math.max(20, JinConsole.getColumns() - 8);
@@ -753,6 +885,7 @@ public class ElowbeAgent extends JinCanvas {
 		if (usage == null) {
 			return;
 		}
+		long previousTokenCount = agentTokenCount;
 		boolean streaming = usage.optBoolean("__streaming", false);
 		long totalTokens = usage.optLong("total_tokens",
 				usage.optLong("prompt_tokens", 0) + usage.optLong("completion_tokens", 0));
@@ -764,6 +897,9 @@ public class ElowbeAgent extends JinCanvas {
 		}
 		agentTokenCount = runTokenTotal + currentStreamTokenTotal;
 		totalAgentTokenCount = tokensAtRunStart + agentTokenCount;
+		if (agentTokenCount > previousTokenCount) {
+			changeBarColor();
+		}
 	}
 
 	private boolean cancelAgent() {
@@ -843,6 +979,7 @@ public class ElowbeAgent extends JinCanvas {
 	public void setAgentModel(String agentModel) {
 		if (agentModel != null && !agentModel.isBlank()) {
 			this.agentModel = agentModel.trim();
+			persistUserSettings();
 		}
 	}
 
@@ -853,6 +990,7 @@ public class ElowbeAgent extends JinCanvas {
 	public void setThinkingEnabled(boolean thinkingEnabled) {
 		this.thinkingEnabled = thinkingEnabled;
 		OllamaAPI.thinkingEnabled = thinkingEnabled;
+		persistUserSettings();
 	}
 
 	public boolean isSubtasksEnabled() {
@@ -861,6 +999,7 @@ public class ElowbeAgent extends JinCanvas {
 
 	public void setSubtasksEnabled(boolean subtasksEnabled) {
 		this.subtasksEnabled = subtasksEnabled;
+		persistUserSettings();
 	}
 
 	public boolean isAgentBrowserWebEnabled() {
@@ -870,6 +1009,7 @@ public class ElowbeAgent extends JinCanvas {
 	public void setAgentBrowserWebEnabled(boolean agentBrowserWebEnabled) {
 		this.agentBrowserWebEnabled = agentBrowserWebEnabled;
 		configureWebTool();
+		persistUserSettings();
 	}
 
 	public String getAgentBrowserCommand() {
@@ -880,6 +1020,7 @@ public class ElowbeAgent extends JinCanvas {
 		if (agentBrowserCommand != null && !agentBrowserCommand.isBlank()) {
 			this.agentBrowserCommand = agentBrowserCommand.trim();
 			configureWebTool();
+			persistUserSettings();
 		}
 	}
 
@@ -976,6 +1117,7 @@ public class ElowbeAgent extends JinCanvas {
 		}
 		ElowbeAgent.agentContextLength = agentContextLength;
 		OllamaAPI.setContextLength(agentContextLength);
+		persistUserSettings();
 	}
 
 	public int getAgentMaxOutputTokens() {
@@ -988,6 +1130,30 @@ public class ElowbeAgent extends JinCanvas {
 		}
 		ElowbeAgent.agentMaxOutputTokens = agentMaxOutputTokens;
 		OllamaAPI.setMaxOutputTokens(agentMaxOutputTokens);
+		persistUserSettings();
+	}
+
+	public List<String> getManualSkillIds() {
+		return manualSkillIds;
+	}
+
+	/** Restores manual skill selection from persisted settings (no console output). */
+	void setPersistedManualSkillIds(List<String> ids) {
+		manualSkillIds = ids == null || ids.isEmpty() ? List.of() : List.copyOf(ids);
+	}
+
+	private void persistUserSettings() {
+		if (applyingPersistedSettings || agentSettings == null) {
+			return;
+		}
+		try {
+			agentSettings.captureFrom(this);
+			agentSettings.save();
+		} catch (IOException e) {
+			if (printWidget != null) {
+				printWidget.println("Could not save settings: " + e.getMessage());
+			}
+		}
 	}
 
 	private static String formatContextLength(int length) {
@@ -1077,6 +1243,20 @@ public class ElowbeAgent extends JinCanvas {
 		printWidget.println("  /output -set N             set max generated tokens (0 = server default)");
 	}
 
+	private void handleHistoryCommand(Command cmd) {
+		if (cmd.has("show")) {
+			printHistoryStatus();
+			return;
+		}
+		printHistoryStatus();
+		printWidget.println("  /history -show             show persisted chat history size");
+	}
+
+	private void printHistoryStatus() {
+		printWidget.println("History messages: " + chatHistory.length());
+		printWidget.println("Tool results in history are stored as compact call + summary entries only.");
+	}
+
 	private void handleCommand(Command cmd) {
 		switch (cmd.getName()) {
 		case "help" -> printHelp(cmd);
@@ -1095,6 +1275,7 @@ public class ElowbeAgent extends JinCanvas {
 		case "web" -> handleWebCommand(cmd);
 		case "context" -> handleContextCommand(cmd);
 		case "output" -> handleOutputCommand(cmd);
+		case "history" -> handleHistoryCommand(cmd);
 		case "system" -> handleSystemCommand(cmd);
 		case "skill" -> handleSkillCommand(cmd);
 		case "review" -> startGitReview();
@@ -1176,6 +1357,26 @@ public class ElowbeAgent extends JinCanvas {
 			printWidget.println("Skills reloaded for " + directory.getPath());
 			printPrimarySkillStatus();
 			printDiscoveredSkillStatus();
+			printManualSkillStatus();
+			return;
+		}
+		if (cmd.has("select")) {
+			openSkillPicker();
+			return;
+		}
+		if (cmd.has("set")) {
+			String value = cmd.get("set");
+			if (value == null || value.isBlank()) {
+				printWidget.println("Error: -set requires skill ids (comma-separated catalog names)");
+				return;
+			}
+			setManualSkillIds(parseSkillIdList(value));
+			return;
+		}
+		if (cmd.has("clear") || cmd.has("auto")) {
+			manualSkillIds = List.of();
+			printWidget.println("Manual skill selection cleared; skills will be auto-selected each run.");
+			persistUserSettings();
 			return;
 		}
 		if (cmd.has("show")) {
@@ -1192,18 +1393,24 @@ public class ElowbeAgent extends JinCanvas {
 				printWidget.println(primarySkill.body);
 			}
 			printDiscoveredSkillStatus();
+			printManualSkillStatus();
 			return;
 		}
 		if (cmd.has("list")) {
 			printPrimarySkillStatus();
 			printDiscoveredSkillStatus();
+			printManualSkillStatus();
 			return;
 		}
 		printWidget.println("Primary skill file: " + Skill.resolvePrimarySkillFile(directory).getPath());
 		printPrimarySkillStatus();
 		printDiscoveredSkillStatus();
+		printManualSkillStatus();
 		printWidget.println("  /skill -show              show loaded skill content");
 		printWidget.println("  /skill -list              list primary and discovered skills");
+		printWidget.println("  /skill -select            pick skills manually (skips auto-selection)");
+		printWidget.println("  /skill -set id1,id2       set manual skills by catalog id");
+		printWidget.println("  /skill -clear             clear manual selection (restore auto-selection)");
 		printWidget.println("  /skill -reload            reload from disk");
 		printWidget.println("Skill directories: .cursor/skills/, skills/");
 	}
@@ -1231,6 +1438,148 @@ public class ElowbeAgent extends JinCanvas {
 		for (Skill skill : discoveredSkills) {
 			printWidget.println("  " + Skill.formatCatalogEntry(skill, directory));
 		}
+	}
+
+	private void printManualSkillStatus() {
+		if (manualSkillIds.isEmpty()) {
+			printWidget.println("Manual skill selection: (auto)");
+			return;
+		}
+		printWidget.println("Manual skill selection (" + manualSkillIds.size() + ", skips auto-selection):");
+		List<Skill> resolved = SkillSelector.resolveReferences(manualSkillIds, collectSkillCandidates(), directory);
+		for (String id : manualSkillIds) {
+			Skill match = null;
+			for (Skill skill : resolved) {
+				if (Skill.normalizeName(skill.learnCatalogPath(directory)).equals(Skill.normalizeName(id))
+						|| Skill.normalizeName(skill.name).equals(Skill.normalizeName(id))) {
+					match = skill;
+					break;
+				}
+			}
+			if (match != null) {
+				printWidget.println("  ✓ " + match.name + " [" + match.learnCatalogPath(directory) + "]");
+			} else {
+				printWidget.println("  ✗ " + id + " (not found)");
+			}
+		}
+	}
+
+	private List<String> parseSkillIdList(String value) {
+		List<String> ids = new ArrayList<>();
+		for (String part : value.split("[,\\s]+")) {
+			if (!part.isBlank()) {
+				ids.add(part.trim());
+			}
+		}
+		return ids;
+	}
+
+	private void setManualSkillIds(List<String> ids) {
+		if (ids.isEmpty()) {
+			manualSkillIds = List.of();
+			printWidget.println("Manual skill selection cleared; skills will be auto-selected each run.");
+			persistUserSettings();
+			return;
+		}
+		List<Skill> candidates = collectSkillCandidates();
+		List<Skill> resolved = SkillSelector.resolveReferences(ids, candidates, directory);
+		List<String> catalogIds = new ArrayList<>();
+		for (Skill skill : resolved) {
+			catalogIds.add(skill.learnCatalogPath(directory));
+		}
+		manualSkillIds = List.copyOf(catalogIds);
+		if (resolved.isEmpty()) {
+			printWidget.println("No matching skills found for: " + String.join(", ", ids));
+			return;
+		}
+		printWidget.println("Manual skills set (" + resolved.size() + ", auto-selection disabled):");
+		for (Skill skill : resolved) {
+			printWidget.println("  ✓ " + skill.name + " [" + skill.learnCatalogPath(directory) + "]");
+		}
+		for (String id : ids) {
+			boolean found = false;
+			for (Skill skill : resolved) {
+				if (Skill.normalizeName(skill.learnCatalogPath(directory)).equals(Skill.normalizeName(id))
+						|| Skill.normalizeName(skill.name).equals(Skill.normalizeName(id))) {
+					found = true;
+					break;
+				}
+			}
+			if (!found) {
+				printWidget.println("  ✗ " + id + " (not found)");
+			}
+		}
+		persistUserSettings();
+	}
+
+	private void openSkillPicker() {
+		if (skillPickerWidget != null && !skillPickerWidget.isDestroyed()) {
+			skillPickerWidget.takeFocus();
+			return;
+		}
+
+		loadSkills();
+		List<Skill> candidates = collectSkillCandidates();
+		if (candidates.isEmpty()) {
+			printWidget.println("No skills available to select.");
+			printDiscoveredSkillStatus();
+			return;
+		}
+
+		String[] labels = new String[candidates.size()];
+		String[] catalogIds = new String[candidates.size()];
+		boolean[] checked = new boolean[candidates.size()];
+		for (int i = 0; i < candidates.size(); i++) {
+			Skill skill = candidates.get(i);
+			String catalogId = skill.learnCatalogPath(directory);
+			catalogIds[i] = catalogId;
+			labels[i] = skill.name + " [" + catalogId + "]";
+			for (String manualId : manualSkillIds) {
+				if (Skill.normalizeName(manualId).equals(Skill.normalizeName(catalogId))) {
+					checked[i] = true;
+					break;
+				}
+			}
+		}
+
+		int panelWidth = JinConsole.getColumns() - 4;
+		int panelHeight = JinConsole.getRows() - 6;
+		int column = (JinConsole.getColumns() - panelWidth) / 2;
+		int row = (JinConsole.getRows() - panelHeight) / 2;
+
+		SkillMultiSelectWidget picker = new SkillMultiSelectWidget(column, row, labels, checked);
+		picker.panelWidth = panelWidth;
+		picker.panelHeight = panelHeight;
+		picker.title = "Select Skills";
+		picker.elevation = 100;
+		picker.color = Colors.white;
+		picker.onCancel = () -> {
+			printWidget.println("Skill selection cancelled.");
+			closeSkillPicker();
+		};
+		picker.onConfirm = () -> {
+			List<String> selectedIds = new ArrayList<>();
+			for (int i = 0; i < catalogIds.length; i++) {
+				if (picker.isChecked(i)) {
+					selectedIds.add(catalogIds[i]);
+				}
+			}
+			closeSkillPicker();
+			setManualSkillIds(selectedIds);
+		};
+
+		skillPickerWidget = picker;
+		addWidget(picker);
+		picker.takeFocus();
+	}
+
+	private void closeSkillPicker() {
+		if (skillPickerWidget == null) {
+			return;
+		}
+		removeWidget(skillPickerWidget);
+		skillPickerWidget = null;
+		commandInput.takeFocus();
 	}
 
 	private void handleSystemCommand(Command cmd) {
@@ -1301,7 +1650,8 @@ public class ElowbeAgent extends JinCanvas {
 			return;
 		}
 		if (agentSettings.isProjectsRoot(directory)) {
-			printWidget.println("Open a project first with /open or /new. Git review is not available in the projects folder.");
+			printWidget.println(
+					"Open a project first with /open or /new. Git review is not available in the projects folder.");
 			return;
 		}
 		if (gitReviewWidget != null && !gitReviewWidget.isDestroyed()) {
@@ -1309,6 +1659,7 @@ public class ElowbeAgent extends JinCanvas {
 			return;
 		}
 
+		printWidget.setColor(Colors.blue);
 		printWidget.println("Loading git changes...");
 
 		new Thread(() -> {
@@ -1317,6 +1668,8 @@ public class ElowbeAgent extends JinCanvas {
 				List<FileChange> changes = GitService.listChanges(directory);
 				showGitReview(changes);
 			} catch (Exception e) {
+				printWidget.setColor(Colors.blue);
+
 				printWidget.println("Git review failed: " + e.getMessage());
 			}
 		}, "elowbe-git-review-load").start();
@@ -1324,6 +1677,8 @@ public class ElowbeAgent extends JinCanvas {
 
 	private void showGitReview(List<FileChange> changes) {
 		if (changes.isEmpty()) {
+			printWidget.setColor(Colors.orange);
+
 			printWidget.println("No changes to review.");
 			return;
 		}
@@ -1421,19 +1776,46 @@ public class ElowbeAgent extends JinCanvas {
 			return;
 		}
 
-		printWidget.println("Generating commit message for " + acceptedReviewCount + " accepted change(s)...");
+		pendingCommitSubject = null;
+		awaitingCommitDescription = false;
+		awaitingCommitMessage = true;
+		printWidget.println("Enter commit message for " + acceptedReviewCount + " accepted change(s):");
+		commandInput.takeFocus();
+	}
 
+	private void handleCommitMessageInput(String line) {
+		commandInput.setValue("");
+		if (line.isBlank()) {
+			printWidget.setColor(Colors.red);
+			printWidget.println("Commit message is required.");
+			return;
+		}
+		commandInput.addCommandToHistory(line);
+		printWidget.println("> " + line);
+		pendingCommitSubject = line;
+		awaitingCommitMessage = false;
+		awaitingCommitDescription = true;
+		printWidget.println("Enter commit description (optional, press Enter to skip):");
+	}
+
+	private void handleCommitDescriptionInput(String line) {
+		commandInput.setValue("");
+		if (!line.isBlank()) {
+			commandInput.addCommandToHistory(line);
+			printWidget.println("> " + line);
+		} else {
+			printWidget.println("> (skipped)");
+		}
+		awaitingCommitDescription = false;
+		String subject = pendingCommitSubject;
+		pendingCommitSubject = null;
+		CommitMessage message = new CommitMessage(subject, line);
+		submitGitCommit(message);
+	}
+
+	private void submitGitCommit(CommitMessage message) {
 		new Thread(() -> {
 			try {
-				String diffSummary = GitService.stagedDiffSummary(directory);
-				String previousModel = OllamaAPI.model;
-				OllamaAPI.model = agentModel;
-				CommitMessage message;
-				try {
-					message = GitService.generateCommitMessage(diffSummary);
-				} finally {
-					OllamaAPI.model = previousModel;
-				}
 				GitService.commit(directory, message);
 				printWidget.setColor(Colors.green);
 				printWidget.println("Committed: " + message.subject);
@@ -1452,9 +1834,16 @@ public class ElowbeAgent extends JinCanvas {
 		pendingReviewChanges.clear();
 		reviewIndex = 0;
 		acceptedReviewCount = 0;
+		cancelPendingCommitInput();
 		if (message != null && !message.isBlank()) {
 			printWidget.println(message);
 		}
+	}
+
+	private void cancelPendingCommitInput() {
+		awaitingCommitMessage = false;
+		awaitingCommitDescription = false;
+		pendingCommitSubject = null;
 	}
 
 	private void closeGitReviewWidget() {
@@ -1563,6 +1952,7 @@ public class ElowbeAgent extends JinCanvas {
 					return;
 				}
 				agentSettings.setProjectsDirectory(parent);
+				persistUserSettings();
 				createNewProject(parent, name);
 			} catch (IOException e) {
 				printWidget.println("New project failed: " + e.getMessage());
@@ -1636,6 +2026,7 @@ public class ElowbeAgent extends JinCanvas {
 				return;
 			}
 			agentSettings.setProjectsDirectory(parent);
+			persistUserSettings();
 			createNewProject(parent, projectName);
 		} catch (IOException e) {
 			printWidget.println("New project failed: " + e.getMessage());
@@ -1830,6 +2221,7 @@ public class ElowbeAgent extends JinCanvas {
 			printWidget.println("/web               configure web tool backend (Selenium or agent-browser)");
 			printWidget.println("/context           set LLM context window size");
 			printWidget.println("/output            set max tokens generated per LLM response");
+			printWidget.println("/history           show persisted chat history size");
 			printWidget.println("/system            system prompt (" + SYSTEM_PROMPT_FILE.getPath() + ")");
 			printWidget.println("/skill             skill.md supplement and .cursor/skills/");
 			printWidget.println("/review            review agent changes and commit");
@@ -1853,8 +2245,10 @@ public class ElowbeAgent extends JinCanvas {
 		printWidget.println("  /web -show");
 		printWidget.println("  /context -show");
 		printWidget.println("  /output -show");
+		printWidget.println("  /history -show");
 		printWidget.println("  /system -show");
 		printWidget.println("  /skill -list");
+		printWidget.println("  /skill -select");
 		printWidget.println("  /review");
 		printWidget.println("  /run");
 		printWidget.println("  /new project-name");
@@ -1913,7 +2307,7 @@ public class ElowbeAgent extends JinCanvas {
 		// Change properties and do work here
 
 		if (t >= 0) {
-			t += delta*10;
+			t += delta * 10;
 			barColor = colorInterpolate(barColor, targetColor, t);
 		}
 		if (t >= 1) {
@@ -1971,7 +2365,6 @@ public class ElowbeAgent extends JinCanvas {
 
 		t2d.drawBox(0, commandInput.row, JinConsole.getColumns(), commandInput.height - 1);
 
-		
 		t2d.setColor(Colors.white);
 		t2d.drawBox(0, 0, JinConsole.getColumns(), JinConsole.getRows());
 		// t2d.setColor(Colors.gray);
@@ -1989,7 +2382,7 @@ public class ElowbeAgent extends JinCanvas {
 					+ tokenCost(totalAgentTokenCount) + "]" + formatSelectedSkillsStatus();
 		} else {
 			tokenMeter = agentModel + " [" + totalAgentTokenCount + " tokens : " + tokenCost(totalAgentTokenCount)
-					+ "]";
+					+ "]" + formatManualSkillsStatus();
 		}
 		t2d.drawString(" " + tokenMeter + " ", 2, 0);
 	}
@@ -2039,6 +2432,108 @@ public class ElowbeAgent extends JinCanvas {
 			controlHeld = pressed;
 		} else if (e.getKeyCode() == KeyEvent.VK_SPACE) {
 			spaceHeld = pressed;
+		}
+	}
+
+	private static class SkillMultiSelectWidget extends OptionsWidget {
+		private final boolean[] checked;
+		Runnable onConfirm;
+
+		SkillMultiSelectWidget(int x, int y, String[] options, boolean[] checked) {
+			super(x, y, options);
+			this.checked = checked;
+		}
+
+		boolean isChecked(int index) {
+			return index >= 0 && index < checked.length && checked[index];
+		}
+
+		@Override
+		protected void drawPanel(JinGraphics t2d) {
+			width = panelWidth;
+			height = panelHeight;
+
+			t2d.setColor(Color.black);
+			t2d.fillRect(' ', 0, 0, width, height);
+			t2d.setColor(color);
+			t2d.drawBox(0, 0, width, height);
+
+			int listRow = 1;
+			if (title != null && !title.isEmpty()) {
+				t2d.drawString(" " + title + " ", 2, 0);
+				listRow = 2;
+			}
+
+			int footerRows = 1;
+			int visibleRows = Math.max(1, height - listRow - footerRows - 1);
+			clampScroll(visibleRows);
+
+			for (int row = 0; row < visibleRows; row++) {
+				int index = scrollOffset + row;
+				if (index >= options.length) {
+					break;
+				}
+
+				String prefix = checked[index] ? "[x] " : "[ ] ";
+				String line = prefix + options[index];
+				if (line.length() > width - 4) {
+					line = line.substring(0, Math.max(0, width - 7)) + "...";
+				}
+
+				if (index == selected) {
+					t2d.setHighlight(isFocused());
+					t2d.setColor(color);
+				} else {
+					t2d.setHighlight(false);
+					t2d.setColor(Colors.lightgray);
+				}
+
+				int y = listRow + row;
+				t2d.drawString(line, 2, y);
+				if (index == selected) {
+					t2d.drawChar('[', 1, y);
+					t2d.drawChar(']', Math.min(width - 2, line.length() + 2), y);
+				}
+			}
+
+			t2d.setHighlight(false);
+			t2d.setColor(Colors.lightgray);
+			t2d.drawString(" Space toggle  Enter confirm  Esc cancel ", 2, height - 2);
+		}
+
+		@Override
+		public void keyDown(KeyEvent e) {
+			if (e.getKeyCode() == KeyEvent.VK_ESCAPE && onCancel != null) {
+				onCancel.run();
+				return;
+			}
+
+			if (options == null || options.length == 0) {
+				return;
+			}
+
+			if (e.getKeyCode() == KeyEvent.VK_UP) {
+				selected += options.length - 1;
+			}
+			if (e.getKeyCode() == KeyEvent.VK_DOWN) {
+				selected += 1;
+			}
+			selected = selected % options.length;
+
+			if (panelWidth > 0 && panelHeight > 0) {
+				int listRow = title != null && !title.isEmpty() ? 2 : 1;
+				clampScroll(Math.max(1, panelHeight - listRow - 2));
+			}
+
+			if (e.getKeyCode() == KeyEvent.VK_SPACE) {
+				checked[selected] = !checked[selected];
+				return;
+			}
+			if (e.getKeyCode() == KeyEvent.VK_ENTER) {
+				if (onConfirm != null) {
+					onConfirm.run();
+				}
+			}
 		}
 	}
 

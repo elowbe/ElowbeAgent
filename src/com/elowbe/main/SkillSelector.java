@@ -167,6 +167,10 @@ public final class SkillSelector {
 		return "";
 	}
 
+	public static List<Skill> resolveReferences(List<String> ids, List<Skill> candidates, File runDirectory) {
+		return resolveSelected(ids, candidates, runDirectory);
+	}
+
 	private static List<Skill> resolveSelected(List<String> ids, List<Skill> candidates, File runDirectory) {
 		if (ids.isEmpty()) {
 			return List.of();

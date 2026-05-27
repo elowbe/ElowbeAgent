@@ -12,10 +12,9 @@ import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 import org.json.JSONArray;
+import org.json.JSONException;
 import org.json.JSONObject;
 
 import com.elowbe.main.AgentSettings;
@@ -38,8 +37,6 @@ public final class GitService {
 			this.untracked = untracked;
 		}
 	}
-
-	private static final Pattern SUBJECT_BODY = Pattern.compile("(?s)^SUBJECT:\\s*(.+?)\\s*BODY:\\s*(.*)$");
 
 	private static final String DEFAULT_GITIGNORE = """
 			# Compiled Java
@@ -250,22 +247,36 @@ public final class GitService {
 	public static CommitMessage generateCommitMessage(String diffSummary) throws IOException {
 		JSONArray messages = new JSONArray();
 		messages.put(new JSONObject().put("role", "system").put("content",
-				"You write concise git commit messages. Respond with exactly two lines using this format:\n"
-						+ "SUBJECT: <imperative subject, max 72 chars, no quotes>\n"
-						+ "BODY: <1-3 sentence description of why the change matters>"));
+				"You write concise git commit messages. Return only the structured JSON object requested by the schema. "
+						+ "The subject must be imperative, max 72 chars, and not quoted. "
+						+ "The description must be 1-3 sentences explaining why the change matters."));
 		messages.put(new JSONObject().put("role", "user").put("content",
 				"Write a commit message for these staged changes:\n\n" + diffSummary));
 
-		JSONObject response = OllamaAPI.generateChatCompletion(messages);
+		JSONObject response = OllamaAPI.generateChatCompletion(messages, commitMessageSchema());
 		String content = extractAssistantContent(response);
 		return parseCommitMessage(content);
+	}
+
+	public static CommitMessage generateCommitMessage(String diffSummary, String model) throws IOException {
+		String previousModel = OllamaAPI.model;
+		if (model != null && !model.isBlank()) {
+			OllamaAPI.model = model.trim();
+		}
+		try {
+			return generateCommitMessage(diffSummary);
+		} finally {
+			OllamaAPI.model = previousModel;
+		}
 	}
 
 	public static void commit(File directory, CommitMessage message) throws IOException, InterruptedException {
 		if (message == null || message.subject.isBlank()) {
 			throw new IOException("Commit message is empty");
 		}
-		CommandResult result = runGit(directory, "commit", "-m", message.subject, "-m", message.body);
+		CommandResult result = message.body.isBlank()
+				? runGit(directory, "commit", "-m", message.subject)
+				: runGit(directory, "commit", "-m", message.subject, "-m", message.body);
 		if (result.exitCode != 0) {
 			throw new IOException("git commit failed: " + result.combinedOutput());
 		}
@@ -355,21 +366,36 @@ public final class GitService {
 		if (content == null || content.isBlank()) {
 			return new CommitMessage("Update project files", "Changes reviewed and accepted in ElowbeAgent.");
 		}
-		Matcher matcher = SUBJECT_BODY.matcher(content.trim());
-		if (matcher.matches()) {
-			return new CommitMessage(matcher.group(1).trim(), matcher.group(2).trim());
+		JSONObject parsed = parseJson(content);
+		if (parsed == null) {
+			return new CommitMessage("Update project files", "Changes reviewed and accepted in ElowbeAgent.");
 		}
-		String[] lines = content.trim().split("\n", 2);
-		String subject = lines[0].trim();
-		String body = lines.length > 1 ? lines[1].trim() : "";
-		return new CommitMessage(stripPrefix(subject, "SUBJECT:"), stripPrefix(body, "BODY:"));
+		return new CommitMessage(parsed.optString("subject", ""), parsed.optString("description", ""));
 	}
 
-	private static String stripPrefix(String value, String prefix) {
-		if (value.regionMatches(true, 0, prefix, 0, prefix.length())) {
-			return value.substring(prefix.length()).trim();
+	private static JSONObject parseJson(String content) {
+		String text = content == null ? "" : content.trim();
+		if (text.startsWith("```")) {
+			int firstNewline = text.indexOf('\n');
+			int closing = text.lastIndexOf("```");
+			if (firstNewline >= 0 && closing > firstNewline) {
+				text = text.substring(firstNewline + 1, closing).trim();
+			}
 		}
-		return value;
+		try {
+			return new JSONObject(text);
+		} catch (JSONException e) {
+			int start = text.indexOf('{');
+			int end = text.lastIndexOf('}');
+			if (start >= 0 && end > start) {
+				try {
+					return new JSONObject(text.substring(start, end + 1));
+				} catch (JSONException ignored) {
+					return null;
+				}
+			}
+			return null;
+		}
 	}
 
 	private static String extractAssistantContent(JSONObject response) {
@@ -378,6 +404,20 @@ public final class GitService {
 			return message.optString("content", "");
 		}
 		return response.optString("response", "");
+	}
+
+	private static JSONObject commitMessageSchema() {
+		return new JSONObject()
+				.put("type", "object")
+				.put("additionalProperties", false)
+				.put("required", new JSONArray().put("subject").put("description"))
+				.put("properties", new JSONObject()
+						.put("subject", new JSONObject()
+								.put("type", "string")
+								.put("description", "Imperative git commit subject, max 72 characters."))
+						.put("description", new JSONObject()
+								.put("type", "string")
+								.put("description", "One to three sentences explaining why the change matters.")));
 	}
 
 	private static CommandResult runGit(File directory, String... args) throws IOException, InterruptedException {

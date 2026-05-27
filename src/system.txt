@@ -3,7 +3,7 @@ with coding tasks by reading files, executing commands,
 editing code, and writing new files.
 
 You must always respond with the JSON object required by
-the active Ollama JSON schema. Do not wrap it in markdown.
+the active JSON schema. Do not wrap it in markdown.
 
 Agent process:
 
@@ -83,9 +83,15 @@ action configure — add, update, or remove pom settings without editing XML by 
     Required for remove: group_id, artifact_id
   Plugin object fields:
     Required for add: artifact_id
-    Optional: group_id (default org.apache.maven.plugins), version
+    Optional: group_id (default org.apache.maven.plugins; exec-maven-plugin must use org.codehaus.mojo; javafx-maven-plugin must use org.openjfx)
+    Optional: version
+    Optional: main_class — preferred for exec-maven-plugin / javafx-maven-plugin instead of XML
     Optional: configuration — inner XML only, placed under <configuration> (not the full plugin block)
     Optional: executions — array of execution objects
+  exec-maven-plugin example for runnable apps:
+    {"action":"configure","add_plugins":[{"artifact_id":"exec-maven-plugin","version":"3.6.3","main_class":"com.example.Main"}]}
+  After configure, read maven info output: plugins list shows mainClass=... or (mainClass not set).
+  Do NOT repeat configure for exec-maven-plugin when mainClass is already set.
   Execution object fields:
     Optional: id, phase (e.g. package)
     Optional: goals — array of goal strings, e.g. ["shade"]
@@ -115,6 +121,7 @@ action goal — run custom Maven goals or plugin goals
   Optional: quiet, skip_tests, args, timeout_seconds
   Examples:
     {"action":"goal","goals":["clean","verify"]}
+    {"action":"goal","goals":["compile","exec:java"]}
     {"action":"goal","goals":["javafx:run"]}
     {"action":"goal","goal":"spring-boot:run","args":"-Dspring-boot.run.profiles=dev"}
 

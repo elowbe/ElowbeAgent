@@ -31,6 +31,22 @@ public final class MavenTool {
 		return execute(arguments, workingDirectory, NEVER_CANCEL);
 	}
 
+	/** Repair known plugin groupId mistakes and exec-maven-plugin mainClass config before run. */
+	public static void prepareExecJavaProject(File projectRoot) throws IOException {
+		File pomFile = new File(projectRoot, "pom.xml");
+		if (!pomFile.isFile()) {
+			return;
+		}
+		PomModel model = PomModel.load(pomFile);
+		boolean changed = model.repairMisconfiguredPlugins() > 0;
+		if (ensureExecMainClassConfigured(model, projectRoot)) {
+			changed = true;
+		}
+		if (changed) {
+			model.save();
+		}
+	}
+
 	public static ToolResult execute(JSONObject arguments, File workingDirectory, BooleanSupplier cancelRequested) {
 		if (arguments == null) {
 			arguments = new JSONObject();
@@ -109,7 +125,7 @@ public final class MavenTool {
 	private static ToolResult configure(JSONObject arguments, File projectRoot) throws IOException {
 		File pomFile = new File(projectRoot, "pom.xml");
 		PomModel model = PomModel.load(pomFile);
-		int changes = 0;
+		int changes = model.repairMisconfiguredPlugins();
 
 		Map<String, String> coordinates = PomModel.parseCoordinates(arguments);
 		for (Map.Entry<String, String> entry : coordinates.entrySet()) {
@@ -163,14 +179,22 @@ public final class MavenTool {
 			}
 		}
 
+		if (ensureExecMainClassConfigured(model, projectRoot)) {
+			changes++;
+		}
+
 		if (changes == 0) {
-			return ToolResult.output("maven configure: no changes requested");
+			StringBuilder unchanged = new StringBuilder("maven configure: no changes requested\n");
+			unchanged.append(model.summarize());
+			appendExecMainClassHint(unchanged, model, projectRoot);
+			return ToolResult.output(unchanged.toString().trim());
 		}
 
 		model.save();
 		StringBuilder result = new StringBuilder();
 		result.append("maven configure: updated ").append(changes).append(" item(s)\n");
 		result.append(model.summarize());
+		appendExecMainClassHint(result, model, projectRoot);
 		return ToolResult.output(result.toString().trim());
 	}
 
@@ -208,6 +232,7 @@ public final class MavenTool {
 
 	private static ToolResult runMaven(File projectRoot, List<String> goals, JSONObject arguments,
 			BooleanSupplier cancelRequested) throws IOException, InterruptedException {
+		ensureExecJavaReady(projectRoot, goals, arguments);
 		String shellCommand = buildMavenShellCommand(goals, arguments);
 		Duration timeout = resolveTimeout(arguments);
 		if (cancelRequested.getAsBoolean()) {
@@ -312,6 +337,67 @@ public final class MavenTool {
 		return command.toString();
 	}
 
+	private static void ensureExecJavaReady(File projectRoot, List<String> goals, JSONObject arguments)
+			throws IOException {
+		if (!goalsContainExecJava(goals)) {
+			return;
+		}
+		File pomFile = new File(projectRoot, "pom.xml");
+		if (!pomFile.isFile()) {
+			return;
+		}
+		PomModel model = PomModel.load(pomFile);
+		boolean changed = model.repairMisconfiguredPlugins() > 0;
+		if (ensureExecMainClassConfigured(model, projectRoot)) {
+			changed = true;
+		}
+		if (changed) {
+			model.save();
+		}
+		String mainClass = model.execMainClass();
+		if (mainClass.isBlank()) {
+			return;
+		}
+		String extraArgs = first(arguments, "args", "maven_args");
+		if (extraArgs.contains("exec.mainClass") || extraArgs.contains("mainClass=")) {
+			return;
+		}
+		String property = "-Dexec.mainClass=" + shellQuote(mainClass);
+		arguments.put("args", extraArgs.isBlank() ? property : extraArgs.trim() + " " + property);
+	}
+
+	private static boolean ensureExecMainClassConfigured(PomModel model, File projectRoot) throws IOException {
+		if (!model.hasExecMavenPlugin() || !model.execMainClass().isBlank()) {
+			return false;
+		}
+		String inferred = MavenMainClassFinder.findMainClass(projectRoot);
+		return model.ensureExecMainClass(inferred);
+	}
+
+	private static void appendExecMainClassHint(StringBuilder result, PomModel model, File projectRoot)
+			throws IOException {
+		if (!model.hasExecMavenPlugin() || !model.execMainClass().isBlank()) {
+			return;
+		}
+		String inferred = MavenMainClassFinder.findMainClass(projectRoot);
+		result.append("\nexec-maven-plugin: mainClass is still not set.");
+		if (!inferred.isBlank()) {
+			result.append(" Use main_class \"").append(inferred)
+					.append("\" in add_plugins, then run maven goal exec:java.");
+		} else {
+			result.append(" Add main_class to add_plugins or create a class with public static void main first.");
+		}
+	}
+
+	private static boolean goalsContainExecJava(List<String> goals) {
+		for (String goal : goals) {
+			if (goal != null && goal.trim().equalsIgnoreCase("exec:java")) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	private static String shellQuote(String value) {
 		if (value.matches("[A-Za-z0-9_./:@+-]+")) {
 			return value;
@@ -350,11 +436,16 @@ public final class MavenTool {
 						first(execution, "configuration", "configuration_xml")));
 			}
 		}
+		String configuration = first(object, "configuration", "configuration_xml");
+		String mainClass = first(object, "main_class", "mainClass");
+		if (configuration.isBlank() && !mainClass.isBlank()) {
+			configuration = "<mainClass>" + mainClass.trim() + "</mainClass>";
+		}
 		return new PomModel.PluginSpec(
 				first(object, "group_id", "groupId"),
 				first(object, "artifact_id", "artifactId"),
 				first(object, "version"),
-				first(object, "configuration", "configuration_xml"),
+				configuration,
 				executions);
 	}
 
@@ -444,6 +535,10 @@ public final class MavenTool {
 				{"action":"init","group_id":"com.elowbe","artifact_id":"lwjgl-cube","java_version":"21","name":"LWJGL Cube"}
 
 				For compile, test, package, or goal, only action is required unless you need extra flags.
+
+				For exec-maven-plugin in configure add_plugins, set main_class (preferred) or configuration XML with <mainClass>.
+				Example: {"action":"configure","add_plugins":[{"artifact_id":"exec-maven-plugin","version":"3.6.3","main_class":"com.example.Main"}]}
+				Do not re-configure exec-maven-plugin if maven info already shows mainClass=...
 				""".trim();
 	}
 
@@ -620,6 +715,10 @@ public final class MavenTool {
 		String configuration = first(plugin, "configuration", "configuration_xml");
 		if (!configuration.isBlank()) {
 			label.append(" configuration=").append(singleLine(configuration));
+		}
+		String mainClass = first(plugin, "main_class", "mainClass");
+		if (!mainClass.isBlank()) {
+			label.append(" main_class=").append(mainClass.trim());
 		}
 		if (plugin.has("executions") && !plugin.isNull("executions")) {
 			JSONArray executions = plugin.getJSONArray("executions");
