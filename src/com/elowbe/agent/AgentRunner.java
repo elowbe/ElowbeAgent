@@ -146,6 +146,12 @@ public class AgentRunner {
 		void compact(JSONArray messages) throws IOException;
 	}
 
+	/** Supplies a user message injected while the agent is busy; {@code poll} clears the pending interjection. */
+	@FunctionalInterface
+	public interface InterjectionSink {
+		JSONObject poll();
+	}
+
 	private AgentRunner() {
 	}
 
@@ -176,28 +182,48 @@ public class AgentRunner {
 			ThinkingSink thinkingSink, ToolSink toolSink, UsageSink usageSink, BooleanSupplier cancelRequested,
 			boolean thinkingEnabled, boolean subtasksEnabled) throws IOException {
 		run(messages, workingDirectory, tokenSink, thinkingSink, toolSink, usageSink, cancelRequested,
-				thinkingEnabled, subtasksEnabled, null);
+				cancelRequested, null, thinkingEnabled, subtasksEnabled);
+	}
+
+	public static void run(JSONArray messages, File workingDirectory, TokenSink tokenSink,
+			ThinkingSink thinkingSink, ToolSink toolSink, UsageSink usageSink, BooleanSupplier cancelRequested,
+			BooleanSupplier operationInterrupt, InterjectionSink interjectionSink, boolean thinkingEnabled,
+			boolean subtasksEnabled) throws IOException {
+		run(messages, workingDirectory, tokenSink, thinkingSink, toolSink, usageSink, cancelRequested,
+				operationInterrupt, interjectionSink, thinkingEnabled, subtasksEnabled, null);
 	}
 
 	public static void run(JSONArray messages, File workingDirectory, TokenSink tokenSink,
 			ThinkingSink thinkingSink, ToolSink toolSink, UsageSink usageSink, BooleanSupplier cancelRequested,
 			boolean thinkingEnabled, boolean subtasksEnabled, HistoryCompactor historyCompactor) throws IOException {
-		run(messages, workingDirectory, tokenSink, thinkingSink, toolSink, usageSink, cancelRequested, 0,
-				thinkingEnabled, subtasksEnabled, historyCompactor);
+		run(messages, workingDirectory, tokenSink, thinkingSink, toolSink, usageSink, cancelRequested,
+				cancelRequested, null, thinkingEnabled, subtasksEnabled, historyCompactor);
+	}
+
+	public static void run(JSONArray messages, File workingDirectory, TokenSink tokenSink,
+			ThinkingSink thinkingSink, ToolSink toolSink, UsageSink usageSink, BooleanSupplier cancelRequested,
+			BooleanSupplier operationInterrupt, InterjectionSink interjectionSink, boolean thinkingEnabled,
+			boolean subtasksEnabled, HistoryCompactor historyCompactor) throws IOException {
+		run(messages, workingDirectory, tokenSink, thinkingSink, toolSink, usageSink, cancelRequested,
+				operationInterrupt, interjectionSink, 0, thinkingEnabled, subtasksEnabled, historyCompactor);
 	}
 
 	public static String runSubtask(String task, String context, File workingDirectory, BooleanSupplier cancelRequested)
 			throws IOException {
-		return runSubtask(task, context, workingDirectory, cancelRequested, null, null, null);
+		return runSubtask(task, context, workingDirectory, cancelRequested, cancelRequested, null, null, null);
 	}
 
 	private static String runSubtask(String task, String context, File workingDirectory, BooleanSupplier cancelRequested,
-			ThinkingSink thinkingSink, ToolSink toolSink, UsageSink usageSink) throws IOException {
+			BooleanSupplier operationInterrupt, ThinkingSink thinkingSink, ToolSink toolSink, UsageSink usageSink)
+			throws IOException {
 		if (task == null || task.isBlank()) {
 			return "Subtask error: missing task";
 		}
 		if (cancelRequested == null) {
 			cancelRequested = NEVER_CANCEL;
+		}
+		if (operationInterrupt == null) {
+			operationInterrupt = cancelRequested;
 		}
 		JSONArray messages = new JSONArray();
 		messages.put(new JSONObject()
@@ -215,17 +241,21 @@ public class AgentRunner {
 
 		StringBuilder result = new StringBuilder();
 		run(messages, workingDirectory, result::append, thinkingSink, toolSink, usageSink, cancelRequested,
-				MAX_SUBTASK_DEPTH, OllamaAPI.thinkingEnabled, true, null);
+				operationInterrupt, null, MAX_SUBTASK_DEPTH, OllamaAPI.thinkingEnabled, true, null);
 		String text = result.toString().trim();
 		return text.isBlank() ? "Subtask finished without a final response." : text;
 	}
 
 	private static void run(JSONArray messages, File workingDirectory, TokenSink tokenSink,
 			ThinkingSink thinkingSink, ToolSink toolSink, UsageSink usageSink, BooleanSupplier cancelRequested,
-			int subtaskDepth, boolean thinkingEnabled, boolean subtasksEnabled, HistoryCompactor historyCompactor)
+			BooleanSupplier operationInterrupt, InterjectionSink interjectionSink, int subtaskDepth,
+			boolean thinkingEnabled, boolean subtasksEnabled, HistoryCompactor historyCompactor)
 			throws IOException {
 		if (cancelRequested == null) {
 			cancelRequested = NEVER_CANCEL;
+		}
+		if (operationInterrupt == null) {
+			operationInterrupt = cancelRequested;
 		}
 		if (subtaskDepth == 0) {
 			ensureRunScripts(workingDirectory);
@@ -240,12 +270,19 @@ public class AgentRunner {
 
 		for (int turn = 0; turn < MAX_TURNS; turn++) {
 			throwIfCancelled(cancelRequested);
+			if (drainInterjection(messages, interjectionSink)) {
+				continue;
+			}
 			compactHistoryIfNeeded(messages, historyCompactor, cancelRequested);
 			if (subtaskDepth > 0 && thinkingSink != null) {
 				thinkingSink.accept("Subtask worker turn " + (turn + 1) + " started\n");
 			}
 			LlmCallResult llmResult = streamChatCompletionWithRetries(messages, format, thinkingSink, usageSink,
-					cancelRequested, subtaskDepth, "agent step");
+					operationInterrupt, cancelRequested, subtaskDepth, "agent step");
+			if (llmResult.wasInterrupted()) {
+				drainInterjection(messages, interjectionSink);
+				continue;
+			}
 			if (!llmResult.ok()) {
 				appendLlmCallFailure(messages, "agent step", llmResult.error());
 				stepRetryStreak = 0;
@@ -309,19 +346,22 @@ public class AgentRunner {
 					}
 				}
 				JSONObject arguments = resolveToolArguments(name, step, messages, tokenSink, thinkingSink, usageSink,
-						cancelRequested, subtaskDepth, thinkingEnabled);
+						operationInterrupt, cancelRequested, interjectionSink, subtaskDepth, thinkingEnabled);
 				if (arguments == null) {
 					continue;
 				}
 				throwIfCancelled(cancelRequested);
-				ToolResult result = executeTool(name, arguments, workingDirectory, cancelRequested, subtaskDepth,
-						subtasksEnabled, thinkingSink, toolSink, usageSink);
+				ToolResult result = executeTool(name, arguments, workingDirectory, cancelRequested, operationInterrupt,
+						subtaskDepth, subtasksEnabled, thinkingSink, toolSink, usageSink);
 				throwIfCancelled(cancelRequested);
 				if (toolSink != null) {
 					toolSink.accept(name, arguments, result.getOutput());
 				}
 				appendToolResult(messages, name, arguments, result.getOutput());
 				compactHistoryIfNeeded(messages, historyCompactor, cancelRequested);
+				if (drainInterjection(messages, interjectionSink)) {
+					continue;
+				}
 				guard.observe(name, arguments, result.getOutput());
 				if (delegationGuard != null) {
 					delegationGuard.observe(name, result.getOutput(), messages);
@@ -370,11 +410,11 @@ public class AgentRunner {
 	}
 
 	private static ToolResult executeTool(String name, JSONObject arguments, File workingDirectory,
-			BooleanSupplier cancelRequested, int subtaskDepth, boolean subtasksEnabled, ThinkingSink thinkingSink,
-			ToolSink toolSink, UsageSink usageSink)
+			BooleanSupplier cancelRequested, BooleanSupplier operationInterrupt, int subtaskDepth,
+			boolean subtasksEnabled, ThinkingSink thinkingSink, ToolSink toolSink, UsageSink usageSink)
 			throws IOException {
 		if (!"subtask".equals(name)) {
-			return AgentTools.execute(name, arguments, workingDirectory, cancelRequested, subtaskDepth);
+			return AgentTools.execute(name, arguments, workingDirectory, operationInterrupt, subtaskDepth);
 		}
 		if (!subtasksEnabled) {
 			return ToolResult.output("subtask: subtasks are disabled; finish this task directly with other tools");
@@ -403,7 +443,7 @@ public class AgentRunner {
 		StringBuilder evidence = new StringBuilder();
 		String result;
 		try {
-			result = runSubtask(task, context, workingDirectory, cancelRequested, thinkingSink,
+			result = runSubtask(task, context, workingDirectory, cancelRequested, operationInterrupt, thinkingSink,
 					(toolName, toolArguments, toolResult) -> {
 						if (!"done".equals(toolName)) {
 							evidenceToolCount[0]++;
@@ -726,8 +766,9 @@ public class AgentRunner {
 	 * The selection step's thought and plan are passed through so argument generation follows that intent.
 	 */
 	private static JSONObject resolveToolArguments(String toolName, JSONObject selectionStep, JSONArray messages,
-			TokenSink tokenSink, ThinkingSink thinkingSink, UsageSink usageSink, BooleanSupplier cancelRequested,
-			int subtaskDepth, boolean thinkingEnabled) throws IOException {
+			TokenSink tokenSink, ThinkingSink thinkingSink, UsageSink usageSink, BooleanSupplier operationInterrupt,
+			BooleanSupplier cancelRequested, InterjectionSink interjectionSink, int subtaskDepth,
+			boolean thinkingEnabled) throws IOException {
 		JSONObject format = ToolChoiceSchema.buildToolArgumentsSchema(toolName);
 		if (format == null) {
 			return null;
@@ -738,7 +779,12 @@ public class AgentRunner {
 
 		for (int attempt = 1; attempt <= MAX_SCHEMA_RETRIES; attempt++) {
 			LlmCallResult llmResult = streamChatCompletionWithRetries(messages, format, thinkingSink, usageSink,
-					cancelRequested, subtaskDepth, "tool arguments for \"" + toolName + "\"");
+					operationInterrupt, cancelRequested, subtaskDepth, "tool arguments for \"" + toolName + "\"");
+			if (llmResult.wasInterrupted()) {
+				removeMessagesFrom(messages, messageCountBeforeArguments);
+				drainInterjection(messages, interjectionSink);
+				return null;
+			}
 			if (!llmResult.ok()) {
 				removeMessagesFrom(messages, messageCountBeforeArguments);
 				appendLlmCallFailure(messages, "tool arguments for \"" + toolName + "\"", llmResult.error());
@@ -892,29 +938,32 @@ public class AgentRunner {
 	}
 
 	private static LlmCallResult streamChatCompletionWithRetries(JSONArray messages, JSONObject format,
-			ThinkingSink thinkingSink, UsageSink usageSink, BooleanSupplier cancelRequested, int subtaskDepth,
-			String context) throws IOException {
+			ThinkingSink thinkingSink, UsageSink usageSink, BooleanSupplier operationInterrupt,
+			BooleanSupplier cancelRequested, int subtaskDepth, String context) throws IOException {
 		OllamaAPI.ChatStreamListener listener = buildStreamListener(thinkingSink, usageSink, subtaskDepth);
 		IOException lastError = null;
 		for (int attempt = 1; attempt <= MAX_SCHEMA_RETRIES; attempt++) {
 			throwIfCancelled(cancelRequested);
 			try {
 				JSONObject assistantMessage = OllamaAPI.streamChatCompletion(messages, null, format, listener, null,
-						cancelRequested);
+						operationInterrupt);
 				emitUsage(assistantMessage, usageSink);
 				if (assistantMessage != null) {
 					assistantMessage.remove("usage");
 				}
-				return new LlmCallResult(assistantMessage, null);
+				return new LlmCallResult(assistantMessage, null, false);
 			} catch (IOException e) {
-				if (cancelRequested.getAsBoolean() || e instanceof InterruptedIOException) {
+				if (cancelRequested.getAsBoolean()) {
 					throw e;
+				}
+				if (e instanceof InterruptedIOException) {
+					return LlmCallResult.interruptedStep();
 				}
 				lastError = e;
 				logRequestRetry(context, attempt, MAX_SCHEMA_RETRIES, e.getMessage());
 			}
 		}
-		return new LlmCallResult(null, lastError == null ? "request failed" : lastError.getMessage());
+		return new LlmCallResult(null, lastError == null ? "request failed" : lastError.getMessage(), false);
 	}
 
 	private static OllamaAPI.ChatStreamListener buildStreamListener(ThinkingSink thinkingSink, UsageSink usageSink,
@@ -947,9 +996,13 @@ public class AgentRunner {
 		};
 	}
 
-	private record LlmCallResult(JSONObject message, String error) {
+	private record LlmCallResult(JSONObject message, String error, boolean wasInterrupted) {
 		private boolean ok() {
-			return message != null && error == null;
+			return message != null && error == null && !wasInterrupted;
+		}
+
+		private static LlmCallResult interruptedStep() {
+			return new LlmCallResult(null, null, true);
 		}
 	}
 
@@ -1361,6 +1414,20 @@ public class AgentRunner {
 		messages.put(new JSONObject()
 				.put("role", "user")
 				.put("content", content));
+	}
+
+	private static boolean drainInterjection(JSONArray messages, InterjectionSink interjectionSink) {
+		if (interjectionSink == null) {
+			return false;
+		}
+		JSONObject interjection = interjectionSink.poll();
+		if (interjection == null) {
+			return false;
+		}
+		messages.put(interjection);
+		appendUserInstruction(messages, """
+				The user interrupted your current step to send the message above. Stop the current command if it is still running, incorporate their guidance, and continue the original task.""");
+		return true;
 	}
 
 	private static void removeMessagesFrom(JSONArray messages, int startIndex) {

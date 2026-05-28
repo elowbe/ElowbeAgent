@@ -14,6 +14,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BooleanSupplier;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -94,6 +95,8 @@ public class ElowbeAgent extends JinCanvas {
 	private String lastSkillSelectionNote;
 	private final JSONArray chatHistory = new JSONArray();
 	private volatile boolean agentBusy;
+	/** Wall-clock start of the active agent run ({@code 0} when idle). */
+	private volatile long agentRunStartMillis;
 	/** Total input + output tokens consumed by the active or latest agent run. */
 	public volatile long agentTokenCount;
 	/**
@@ -105,6 +108,8 @@ public class ElowbeAgent extends JinCanvas {
 	private long currentStreamTokenTotal;
 	private volatile boolean subtaskActive;
 	private final AtomicBoolean agentCancelRequested = new AtomicBoolean();
+	private final AtomicBoolean interjectRequested = new AtomicBoolean();
+	private JSONObject pendingInterjection;
 	private volatile Thread agentThread;
 	private OptionsWidget modelPickerWidget;
 	private SkillMultiSelectWidget skillPickerWidget;
@@ -359,7 +364,8 @@ public class ElowbeAgent extends JinCanvas {
 		if (content == null || content.isBlank()) {
 			return false;
 		}
-		return content.contains("User request:\n") || content.contains("Runtime project preflight from ElowbeAgent:");
+		return content.contains("User request:\n") || content.contains("Runtime project preflight from ElowbeAgent:")
+				|| content.contains("User interjection (continue your current task with this guidance):");
 	}
 
 	private void syncChatHistoryFromRequest(JSONArray request, int protectedPrefixCount) {
@@ -642,7 +648,7 @@ public class ElowbeAgent extends JinCanvas {
 
 	private void sendAgentInstruction(String instruction, JSONArray images) {
 		if (agentBusy) {
-			printWidget.println("Agent is still responding. Please wait.");
+			interjectAgent(instruction, images);
 			return;
 		}
 
@@ -654,7 +660,10 @@ public class ElowbeAgent extends JinCanvas {
 		currentStreamTokenTotal = 0;
 		subtaskActive = false;
 		agentBusy = true;
+		agentRunStartMillis = System.currentTimeMillis();
 		agentCancelRequested.set(false);
+		interjectRequested.set(false);
+		pendingInterjection = null;
 
 		Thread thread = new Thread(() -> {
 			String previousModel = OllamaAPI.model;
@@ -693,8 +702,7 @@ public class ElowbeAgent extends JinCanvas {
 						printWidget.println("Skill selection: asking LLM (" + skillCandidates.size() + " candidates)...");
 						try {
 							SkillSelector.SkillSelectionResult selection = SkillSelector.select(instruction,
-									skillCandidates, directory,
-									() -> agentCancelRequested.get() || Thread.currentThread().isInterrupted(),
+									skillCandidates, directory, operationInterruptSupplier(),
 									this::addAgentTokenUsage, thinkingEnabled);
 							selectedSkillsForRun = selection.skills();
 							lastSkillSelectionNote = selection.note();
@@ -702,9 +710,13 @@ public class ElowbeAgent extends JinCanvas {
 							if (agentCancelRequested.get() || Thread.currentThread().isInterrupted()) {
 								throw e;
 							}
-							lastSkillSelectionNote = e.getMessage();
-							printWidget
-									.println("Skill selection failed: " + e.getMessage() + " (continuing without skills)");
+							if (interjectRequested.get()) {
+								printWidget.println("Skill selection interrupted by user interjection.");
+							} else {
+								lastSkillSelectionNote = e.getMessage();
+								printWidget.println(
+										"Skill selection failed: " + e.getMessage() + " (continuing without skills)");
+							}
 						}
 					}
 				}
@@ -732,7 +744,7 @@ public class ElowbeAgent extends JinCanvas {
 					printWidget.setColor(subtaskActive ? Colors.darkblue : Colors.lightgray);
 					printWidget.print(thinking);
 				} : null, (name, args, result) -> logToolActivity(name, args, result), this::addAgentTokenUsage,
-						() -> agentCancelRequested.get() || Thread.currentThread().isInterrupted(), thinkingEnabled,
+						agentCancelSupplier(), operationInterruptSupplier(), this::pollInterjection, thinkingEnabled,
 						subtasksEnabled);
 				changeBarColor();
 				if (!agentCancelRequested.get()) {
@@ -762,11 +774,23 @@ public class ElowbeAgent extends JinCanvas {
 					printWidget.println("Agent error: " + e.getMessage());
 				}
 			} finally {
+				long elapsedMillis = agentRunStartMillis > 0
+						? System.currentTimeMillis() - agentRunStartMillis
+						: 0;
+				agentRunStartMillis = 0;
+				if (elapsedMillis > 0) {
+					printWidget.println();
+					printWidget.setColor(Colors.lightgray);
+					printWidget.println("Elapsed time: " + formatElapsedDuration(elapsedMillis));
+					printWidget.setColor(Colors.white);
+				}
 				OllamaAPI.model = previousModel;
 				OllamaAPI.thinkingEnabled = previousThinking;
 				agentBusy = false;
 				subtaskActive = false;
 				agentCancelRequested.set(false);
+				interjectRequested.set(false);
+				pendingInterjection = null;
 				if (agentThread == Thread.currentThread()) {
 					agentThread = null;
 				}
@@ -913,6 +937,48 @@ public class ElowbeAgent extends JinCanvas {
 		printWidget.println("Cancelling agent...");
 		shutdownAgentProcesses();
 		return true;
+	}
+
+	private void interjectAgent(String instruction, JSONArray images) {
+		synchronized (this) {
+			pendingInterjection = buildInterjectionMessage(instruction, images);
+		}
+		interjectRequested.set(true);
+		AgentTools.cancelActiveProcesses();
+		printWidget.setColor(Colors.lightblue);
+		printWidget.println("Interjection sent — stopping current command...");
+		printWidget.setColor(Colors.green);
+	}
+
+	private JSONObject buildInterjectionMessage(String instruction, JSONArray images) {
+		String text = instruction == null || instruction.isBlank()
+				? "Please consider the attached image(s)."
+				: instruction.trim();
+		JSONObject message = new JSONObject().put("role", "user").put("content",
+				"User interjection (continue your current task with this guidance):\n" + text);
+		if (images != null && images.length() > 0) {
+			message.put("images", images);
+		}
+		return message;
+	}
+
+	private synchronized JSONObject pollInterjection() {
+		if (!interjectRequested.get()) {
+			return null;
+		}
+		JSONObject message = pendingInterjection;
+		pendingInterjection = null;
+		interjectRequested.set(false);
+		return message;
+	}
+
+	private BooleanSupplier agentCancelSupplier() {
+		return () -> agentCancelRequested.get() || Thread.currentThread().isInterrupted();
+	}
+
+	private BooleanSupplier operationInterruptSupplier() {
+		return () -> agentCancelRequested.get() || interjectRequested.get()
+				|| Thread.currentThread().isInterrupted();
 	}
 
 	private boolean cancelRun() {
@@ -2291,6 +2357,7 @@ public class ElowbeAgent extends JinCanvas {
 			printWidget.println("/new               create a project in the projects folder");
 			printWidget.println("/open              switch project from the projects folder");
 			printWidget.println("Ctrl+Shift+C      cancel the running agent or /run process");
+			printWidget.println("plain text (busy)  interject — stop current command and guide the agent");
 			printWidget.println("Drag and drop      attach photos to the next agent message");
 			printWidget.println("cd [path]          change directory (~ for home)");
 			printWidget.println("ls [path]          list directory contents");
@@ -2441,13 +2508,31 @@ public class ElowbeAgent extends JinCanvas {
 		}
 		String tokenMeter;
 		if (agentBusy) {
+			String cost = tokenCost(totalAgentTokenCount);
+			String elapsed = formatElapsedDuration(currentAgentRunElapsedMillis());
 			tokenMeter = agentModel + " [" + agentTokenCount + " run | " + totalAgentTokenCount + " session : "
-					+ tokenCost(totalAgentTokenCount) + "]" + formatSelectedSkillsStatus();
+					+ cost + " | " + elapsed + "]" + formatSelectedSkillsStatus();
 		} else {
 			tokenMeter = agentModel + " [" + totalAgentTokenCount + " tokens : " + tokenCost(totalAgentTokenCount)
 					+ "]" + formatManualSkillsStatus();
 		}
 		t2d.drawString(" " + tokenMeter + " ", 2, 0);
+	}
+
+	private long currentAgentRunElapsedMillis() {
+		long start = agentRunStartMillis;
+		return start > 0 ? Math.max(0, System.currentTimeMillis() - start) : 0;
+	}
+
+	private static String formatElapsedDuration(long millis) {
+		long totalSeconds = Math.max(0, millis) / 1000;
+		long hours = totalSeconds / 3600;
+		long minutes = (totalSeconds % 3600) / 60;
+		long seconds = totalSeconds % 60;
+		if (hours > 0) {
+			return String.format(Locale.ROOT, "%d:%02d:%02d", hours, minutes, seconds);
+		}
+		return String.format(Locale.ROOT, "%d:%02d", minutes, seconds);
 	}
 
 	public String tokenCost(float agentTokenCount) {
