@@ -1,3 +1,7 @@
+<p align="center">
+<img height="512" alt="SCR-20260528-sjtg" src="https://github.com/user-attachments/assets/4dd8cf59-64a9-4bc6-ae0b-27780036bf67" />
+</p>
+
 # ElowbeAgent
 
 ElowbeAgent is a desktop coding agent with a terminal-style UI. It helps you build and edit software projects using local or remote LLMs, with built-in tools for reading and writing files, running shell commands, Maven project management, web browsing, and Git review.
@@ -27,7 +31,7 @@ The agent defaults to **Java + Maven** for new projects and can auto-select **Cu
 | **Maven** | Used by the agent and for Java project builds |
 | **Git** | Used for project repos and `/review` |
 | **LLM backend** | At least one of Ollama, LM Studio, or Claude API access |
-| **Eclipse workspace deps** | **JinConsole** and **JInteractive** (sibling Eclipse projects in your workspace) |
+| **Eclipse workspace deps** | [**JinConsole**](https://github.com/elowbe/JinConsole)  |
 | **json-java** | `lib/json-java.jar` on the classpath |
 | **agent-browser** *(recommended)* | [Vercel agent-browser](https://github.com/vercel-labs/agent-browser) CLI for the web tool (default backend) |
 | **Chrome + ChromeDriver** *(optional)* | Fallback when Selenium web backend is enabled |
@@ -48,9 +52,9 @@ cd ElowbeAgent
 
 ElowbeAgent is an Eclipse/Maven project that depends on two sibling projects:
 
-1. Import **JinConsole** and **JInteractive** into the same Eclipse workspace as ElowbeAgent
+1. Import [**JinConsole**](https://github.com/elowbe/JinConsole) into the same Eclipse workspace as ElowbeAgent
 2. Ensure `lib/json-java.jar` exists (place the JAR in the `lib/` folder if it is not already present)
-3. Open the project in Eclipse — the `.classpath` wires JinConsole, JInteractive, and Maven dependencies
+3. Open the project in Eclipse — the `.classpath` wires JinConsole, and Maven dependencies
 
 ### 3. Build with Maven
 
@@ -60,7 +64,7 @@ From the project root:
 mvn compile
 ```
 
-Maven resolves **Selenium** from `pom.xml`. JinConsole and JInteractive must still be available on the Eclipse classpath (or equivalent) to run the main class.
+Maven resolves **Selenium** from `pom.xml`. JinConsole must still be available on the Eclipse classpath (or equivalent) to run the main class.
 
 ### 4. Run the agent
 
