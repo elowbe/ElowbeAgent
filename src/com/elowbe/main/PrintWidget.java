@@ -6,11 +6,10 @@ import java.awt.event.KeyEvent;
 import java.util.ArrayList;
 import java.util.List;
 
-import com.jinteractive.main.Colors;
-
 import lib.console.main.JinGraphics;
 import lib.console.util.ColorData;
 import lib.console.util.ColorExtractor;
+import lib.console.util.Colors;
 import lib.console.util.Pair;
 import lib.console.widgets.Widget;
 

@@ -26,13 +26,13 @@ import com.elowbe.git.GitService.CommitMessage;
 import com.elowbe.git.GitService.FileChange;
 import com.elowbe.tools.AgentTools;
 import com.elowbe.tools.WebTool;
-import com.jinteractive.gui.Settings;
-import com.jinteractive.main.Colors;
 
 import lib.console.main.JinCanvas;
 import lib.console.main.JinConsole;
 import lib.console.main.JinGraphics;
+import lib.console.util.Colors;
 import lib.console.util.OllamaAPI;
+import lib.console.util.Settings;
 import lib.console.widgets.GitDiffReviewWidget;
 import lib.console.widgets.InputWidget;
 import lib.console.widgets.OptionsWidget;
@@ -53,11 +53,11 @@ public class ElowbeAgent extends JinCanvas {
 	 * claude: prefix).
 	 */
 	private static String agentModel = "lmstudio:qwen3.6-27b-mtp";
-	private static String ollamaUrl = "http://10.0.0.8:11434";
+	private static String ollamaUrl = "http://10.0.0.23:11434";
 	/**
 	 * LM Studio OpenAI-compatible API base URL (local server default port 1234).
 	 */
-	private static String lmstudioUrl = "http://10.0.0.8:1234/v1";
+	private static String lmstudioUrl = "http://10.0.0.7:1234/v1";
 	/**
 	 * Context window for LLM calls (Ollama {@code num_ctx}, LM Studio
 	 * {@code context_length}); {@code 0} = server default.
